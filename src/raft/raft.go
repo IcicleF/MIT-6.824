@@ -18,14 +18,27 @@ package raft
 //
 
 import (
-//	"bytes"
+	//	"bytes"
+	"crypto/rand"
+	"math/big"
 	"sync"
 	"sync/atomic"
+	"time"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
+// randomizer
+func rnd(min int, max int) int {
+	x, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
+	return int(x.Int64()) + min
+}
+
+// majority calculator
+func majority(num int) int {
+	return num/2 + 1
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -58,21 +71,44 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	dead      int64               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm int64 // last term server has seen
+	votedFor    int   // candidate ID that received vote in current term
+	logseq      int   // ?
 
+	commitIndex int // index of highest log entry known to be commited
+	lastApplied int // index of highest log entry applied to state machine
+
+	nextIndex  []int // if I am leader, for each server, index of the next log entry to send
+	matchIndex []int // if I am leader, for each server, index of highest log entry known to be replicated
+
+	// Other states to be maintained
+	LeaderId      int64      // current leader
+	role          int64      // my role
+	lastRPC       int64      // arrival time of last valid RPC
+	receivedVotes int64      // my votes in an election
+	rvChannels    []chan int // channels to notify parallel requestVotes
 }
+
+const (
+	RoleLeader = iota
+	RoleFollower
+	RoleCandidate
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = int(atomic.LoadInt64(&rf.currentTerm))
+	isleader = atomic.LoadInt64(&rf.role) == RoleLeader
+
 	return term, isleader
 }
 
@@ -91,7 +127,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +150,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +170,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Server int
+	Term   int
 }
 
 //
@@ -151,6 +186,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Ok   bool
+	Term int
 }
 
 //
@@ -158,6 +195,25 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintln(Info, "Raft %d received RequestVote from %d.", rf.me, args.Server)
+
+	reply.Term = int(atomic.LoadInt64(&rf.currentTerm))
+	if args.Term <= reply.Term {
+		DPrintln(Info, "Raft %d rejected the RequestVote because of smaller term.", rf.me)
+		reply.Ok = false
+		return
+	}
+
+	// Transit to new term and vote for leader
+	reply.Term = args.Term
+	rf.votedFor = args.Server
+	atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
+	reply.Ok = true
+
+	// Valid request from candidate, update last RPC
+	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
+
+	DPrintln(Info, "Raft %d decide to vote for %d in term %d.", rf.me, args.Server, reply.Term)
 }
 
 //
@@ -194,6 +250,106 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// AppendEntries
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Length       int
+	Entries      []interface{}
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Ok   bool
+	Term int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.Term = int(atomic.LoadInt64(&rf.currentTerm))
+	if args.Length != 0 {
+		DPrintln(Error, "AppendEntries with Length > 0 not implemented!")
+		reply.Ok = false
+		return
+	}
+
+	if args.Term < reply.Term {
+		DPrintln(Warning, "Raft %d rejected heartbeat from %d because of smaller term", rf.me, args.LeaderId)
+		reply.Ok = false
+		return
+	} else if args.Term > reply.Term {
+		// Transit to follower
+		atomic.StoreInt64(&rf.role, RoleFollower)
+		atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
+	}
+
+	// Valid request from leader, update related variables
+	atomic.StoreInt64(&rf.LeaderId, int64(args.LeaderId))
+	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
+
+	reply.Ok = true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) rpcBroadcaster(server int, c chan int) {
+	for rf.killed() == false {
+		// Fetch value from channel, and if success, wake up
+		kind := <-c
+
+		switch kind {
+		case BroadcastRequestVote:
+			// Prepare a RequestVote RPC
+			args := RequestVoteArgs{}
+			reply := RequestVoteReply{}
+
+			args.Server = rf.me
+			args.Term = int(atomic.LoadInt64(&rf.currentTerm))
+
+			rf.sendRequestVote(server, &args, &reply)
+
+			// Need to verify that I am still a candidate
+			if atomic.LoadInt64(&rf.role) != RoleCandidate {
+				continue
+			}
+
+			if reply.Ok && reply.Term == int(atomic.LoadInt64(&rf.currentTerm)) {
+				atomic.AddInt64(&rf.receivedVotes, 1)
+			}
+			if reply.Term > int(atomic.LoadInt64(&rf.currentTerm)) {
+				atomic.StoreInt64(&rf.role, RoleFollower)
+				atomic.StoreInt64(&rf.currentTerm, int64(reply.Term))
+			}
+
+		case BroadcastHeartbeat:
+			// Prepare a heartbeat
+			args := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
+
+			args.Term = int(atomic.LoadInt64(&rf.currentTerm))
+			args.LeaderId = rf.me
+			args.PrevLogIndex = 0
+			args.PrevLogTerm = 0
+			args.Length = 0
+			args.LeaderCommit = 0
+
+			rf.sendAppendEntries(server, &args, &reply)
+
+			if !reply.Ok {
+				DPrintln(Warning, "Heartbeat (term: %d) refused by peer %d", rf.me, server)
+			}
+		}
+	}
+}
+
+const (
+	BroadcastRequestVote = iota
+	BroadcastHeartbeat
+)
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -216,7 +372,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -232,53 +387,135 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
+	atomic.StoreInt64(&rf.dead, 1)
 	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
+	z := atomic.LoadInt64(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) broadcast(kind int) {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.rvChannels[i] <- kind
+	}
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	last := atomic.LoadInt64(&rf.lastRPC)
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		time.Sleep(time.Millisecond * time.Duration(rnd(1000, 2000)))
 
+		// Waken up
+		cur := atomic.LoadInt64(&rf.lastRPC)
+		if cur == last {
+			// no RPC arrived, begin election
+			ok := atomic.CompareAndSwapInt64(&rf.role, RoleFollower, RoleCandidate)
+			if !ok {
+				// Cannot transit from follower to candidate (leader will naturally fail)
+				last = cur
+				continue
+			}
+
+			DPrintln(Important, "Raft %d starts election!", rf.me)
+
+			// Repeat election until I am not a candidate
+			for rf.killed() == false {
+				atomic.AddInt64(&rf.currentTerm, 1)
+
+				rf.votedFor = rf.me
+				rf.receivedVotes = 1
+				rf.broadcast(BroadcastRequestVote)
+
+				timeout := (time.Millisecond * time.Duration(rnd(1000, 2000))).Nanoseconds()
+				startTime := time.Now().UnixNano()
+				// As long as I am still a candidate
+				for atomic.LoadInt64(&rf.role) == RoleCandidate && !rf.killed() {
+					curTime := time.Now().UnixNano()
+					if curTime-startTime > timeout {
+						// (c) a period of time goes by no winner
+						continue
+					}
+
+					if atomic.LoadInt64(&rf.receivedVotes) >= int64(majority(len(rf.peers))) {
+						// (a) I win the election
+						DPrintln(Important, "Raft %d thinks it has won!", rf.me)
+						atomic.StoreInt64(&rf.role, RoleLeader)
+						atomic.StoreInt64(&rf.LeaderId, int64(rf.me))
+						rf.broadcast(BroadcastHeartbeat)
+					}
+				}
+				// (b) another server establishes itself as leader
+				if atomic.LoadInt64(&rf.role) != RoleCandidate {
+					break
+				}
+			}
+		}
+		last = cur
 	}
 }
 
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+// The heart is responsible to send out heartbeats when I am leader.
+func (rf *Raft) heart() {
+	for rf.killed() == false {
+		time.Sleep(time.Millisecond * 200)
+		if atomic.LoadInt64(&rf.role) == RoleLeader {
+			rf.broadcast(BroadcastHeartbeat)
+		}
+	}
+}
+
+///
+/// the service or tester wants to create a Raft server.
+/// @param peers      the ports of all the Raft servers (including this one) are in peers[].
+/// @param me         this server's port is peers[me].
+/// 			 	  all the servers' peers[] arrays have the same order.
+/// @param persister  a place for this server to save its persistent state, and also initially
+///                   holds the most recent saved state, if any.
+/// @param applyCh    a channel on which the tester or service expects Raft to send ApplyMsg messages.
+///
+/// Make() must return quickly, so it should start goroutines
+/// for any long-running work.
+///
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	atomic.StoreInt64(&rf.role, RoleFollower)
+	rf.lastRPC = time.Now().UnixNano()
+	rf.rvChannels = make([]chan int, len(peers))
+
+	for i := 0; i < len(peers); i++ {
+		if i == me {
+			continue
+		}
+		rf.rvChannels[i] = make(chan int)
+		go rf.rpcBroadcaster(i, rf.rvChannels[i])
+	}
+	go rf.heart()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
