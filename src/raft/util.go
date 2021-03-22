@@ -11,10 +11,19 @@ const (
 	Important
 	Warning
 	Error
+
+	Exp2A  = 0x1
+	Exp2B  = 0x2
+	Exp2C  = 0x4
+	Exp2D  = 0x8
+	Exp2AB = 0x3
+	Exp2   = 0xF
 )
 
-func DPrintln(typ int, format string, a ...interface{}) (n int, err error) {
-	if Debug {
+const ShownPhase = 0
+
+func DPrintln(phase int, typ int, format string, a ...interface{}) (n int, err error) {
+	if Debug && ((phase & ShownPhase) != 0) {
 		var prefix string
 		var color int = 0
 

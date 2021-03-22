@@ -94,7 +94,8 @@ type Raft struct {
 	role          int64 // my role
 	lastRPC       int64 // arrival time of last valid RPC
 	receivedVotes int64 // my votes in an election
-	// rvChannels    []chan int // channels to notify parallel requestVotes
+
+	applyCh chan ApplyMsg
 }
 
 const (
@@ -198,11 +199,11 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintln(Info, "Raft %d received RequestVote from %d with term %d.", rf.me, args.Server, args.Term)
+	DPrintln(Exp2A, Info, "Raft %d received RequestVote from %d with term %d.", rf.me, args.Server, args.Term)
 
 	reply.Term = int(atomic.LoadInt64(&rf.currentTerm))
 	if args.Term <= reply.Term {
-		DPrintln(Warning, "Raft %d rejected the RequestVote because of smaller term.", rf.me)
+		DPrintln(Exp2A, Warning, "Raft %d rejected the RequestVote because of smaller term.", rf.me)
 		reply.Ok = false
 		return
 	}
@@ -217,7 +218,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// valid request from candidate, update last RPC
 	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
 
-	DPrintln(Info, "Raft %d decide to vote for %d in term %d.", rf.me, args.Server, reply.Term)
+	DPrintln(Exp2A, Info, "Raft %d decide to vote for %d in term %d.", rf.me, args.Server, reply.Term)
 }
 
 //
@@ -272,20 +273,21 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args.Length != 0 {
-		DPrintln(Error, "AppendEntries with Length > 0 not implemented!")
+		DPrintln(Exp2A, Error, "AppendEntries with Length > 0 not implemented!")
 		reply.Ok = false
 		return
 	}
 
 	reply.Term = int(atomic.LoadInt64(&rf.currentTerm))
 	if args.Term < reply.Term {
-		DPrintln(Warning, "Raft %d rejected heartbeat from %d because of smaller term", rf.me, args.LeaderId)
+		DPrintln(Exp2A, Warning, "Raft %d rejected heartbeat from %d because of smaller term",
+			rf.me, args.LeaderId)
 		reply.Ok = false
 		return
 	} else {
 		// Transit to follower
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
-			DPrintln(Important, "Raft %d reverts from leader to follower", rf.me)
+			DPrintln(Exp2A, Important, "Raft %d reverts from leader to follower", rf.me)
 		}
 		atomic.StoreInt64(&rf.role, RoleFollower)
 		atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
@@ -438,7 +440,7 @@ func (rf *Raft) ticker() {
 
 			// repeat election until I am not a candidate
 			for rf.killed() == false {
-				DPrintln(Important, "Raft %d starts election at term %d!",
+				DPrintln(Exp2A, Important, "Raft %d starts election at term %d!",
 					rf.me, atomic.LoadInt64(&rf.currentTerm))
 
 				atomic.AddInt64(&rf.currentTerm, 1)
@@ -460,7 +462,7 @@ func (rf *Raft) ticker() {
 
 					if atomic.LoadInt64(&rf.receivedVotes) >= int64(majority(len(rf.peers))) {
 						// (a) I win the election
-						DPrintln(Important, "Raft %d thinks it has won!", rf.me)
+						DPrintln(Exp2A, Important, "Raft %d thinks it has won!", rf.me)
 						atomic.StoreInt64(&rf.role, RoleLeader)
 						atomic.StoreInt64(&rf.LeaderId, int64(rf.me))
 						rf.broadcast(BroadcastHeartbeat)
@@ -510,24 +512,16 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.votedFor = -1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.applyCh = applyCh
 
 	atomic.StoreInt64(&rf.role, RoleFollower)
 	rf.lastRPC = time.Now().UnixNano()
-	// rf.rvChannels = make([]chan int, len(peers))
-
-	for i := 0; i < len(peers); i++ {
-		if i == me {
-			continue
-		}
-		// rf.rvChannels[i] = make(chan int)
-		// go rf.rpcBroadcaster(i, rf.rvChannels[i])
-	}
-
-	// beat my heart
-	go rf.heart()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// beat my heart
+	go rf.heart()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
