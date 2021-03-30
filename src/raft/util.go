@@ -20,7 +20,7 @@ const (
 	Exp2   = 0xF
 )
 
-const ShownPhase = Exp2AB
+const ShownPhase = 0
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) (n int, err error) {
 	if Debug && ((phase & ShownPhase) != 0) {

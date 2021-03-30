@@ -135,7 +135,7 @@ func (rf *Raft) initFollowerIndexes() {
 	rf.matchIndex = make([]int64, 0)
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex = append(rf.nextIndex, int64(nextInd))
-		rf.matchIndex = append(rf.matchIndex, 0)
+		rf.matchIndex = append(rf.matchIndex, -1)
 	}
 }
 
@@ -250,7 +250,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Transit to new term and follower
 	reply.Term = args.Term
 	atomic.StoreInt64(&rf.role, RoleFollower)
-	atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
+	if atomic.LoadInt64(&rf.currentTerm) != args.Term {
+		atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
+		atomic.StoreInt64(&rf.votedFor, -1)
+	}
 
 	// Valid request from candidate, update last RPC
 	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
@@ -368,9 +371,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.logsLock.RUnlock()
 
 	if !phase2Flag {
-		DPrintln(Exp2B, Warning,
-			"Raft %d rejected AppendEntries from %d because of unmatching prevLogIndex/prevLogTerm.",
-			rf.me, args.LeaderId)
+		if len(args.Entries) != 0 {
+			DPrintln(Exp2B, Warning,
+				"Raft %d rejected AppendEntries from %d because of prevLog unmatch: remote len %d, prev (%d %d).",
+				rf.me, args.LeaderId, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm)
+		}
 		reply.Ok = false
 		return
 	}
@@ -388,6 +393,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > atomic.LoadInt64(&rf.commitIndex) {
 		atomic.StoreInt64(&rf.commitIndex, min(args.LeaderCommit, int64(lastEntry)))
+		rf.applyCond.Signal()
 	}
 }
 
@@ -406,8 +412,8 @@ func (rf *Raft) logApplier() {
 		}
 
 		// Start applying the log
-		applyIndex := rf.lastApplied
 		rf.lastApplied++
+		applyIndex := rf.lastApplied
 
 		rf.logsLock.RLock()
 		command := rf.logs[applyIndex].Command
@@ -416,9 +422,11 @@ func (rf *Raft) logApplier() {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      command,
-			CommandIndex: int(applyIndex),
+			CommandIndex: int(applyIndex) + 1,
 		}
 		rf.applyCh <- applyMsg
+
+		DPrintln(Exp2B, Important, "Raft %d successfully applied log %d = %v.", rf.me, applyIndex, applyMsg)
 	}
 }
 
@@ -434,14 +442,21 @@ func (rf *Raft) logReplicator(server int) {
 			rf.indexesLock.RUnlock()
 
 			for lastLogIndex >= int(nextIndex) {
+				DPrintln(Exp2B, Info, "Raft %d starts replicating log for %d (last %d >= next %d)",
+					rf.me, server, lastLogIndex, nextIndex)
+
 				ok := rf.doSendAppendEntries(server, nextIndex)
 				if ok {
+					DPrintln(Exp2B, Info, "Raft %d: follower %d successfully replicated log to %d",
+						rf.me, server, lastLogIndex)
 					rf.indexesLock.Lock()
 					atomic.StoreInt64(&rf.nextIndex[server], int64(lastLogIndex+1))
 					atomic.StoreInt64(&rf.matchIndex[server], int64(lastLogIndex))
 					rf.indexesLock.Unlock()
 					break
 				}
+				DPrintln(Exp2B, Warning, "Raft %d: follower %d rejected log replication (%d to %d)",
+					rf.me, server, nextIndex, lastLogIndex)
 				nextIndex = atomic.AddInt64(&rf.nextIndex[server], -1)
 			}
 		}
@@ -449,18 +464,17 @@ func (rf *Raft) logReplicator(server int) {
 	}
 }
 
-func (rf *Raft) logCommiter() {
+func (rf *Raft) logCommitter() {
 	for !rf.killed() {
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
 			matchIndex := make([]int, len(rf.peers))
 
 			// Copy matchIndex
+			rf.logsLock.RLock()
 			rf.indexesLock.RLock()
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
-					rf.logsLock.RLock()
 					matchIndex[i] = len(rf.logs) - 1
-					rf.logsLock.RUnlock()
 					continue
 				}
 				matchIndex[i] = int(rf.matchIndex[i])
@@ -475,16 +489,17 @@ func (rf *Raft) logCommiter() {
 			ok := majorityMatched > int(atomic.LoadInt64(&rf.commitIndex))
 
 			// ... and log[N].term == currentTerm
-			rf.logsLock.RLock()
 			ok = ok && rf.logs[majorityMatched].Term == atomic.LoadInt64(&rf.currentTerm)
 			rf.logsLock.RUnlock()
 
 			// Set commitIndex = N
 			if ok {
+				DPrintln(Exp2B, Important, "Raft %d decided logs to %d is commited.", rf.me, majorityMatched)
 				atomic.StoreInt64(&rf.commitIndex, int64(majorityMatched))
+				rf.applyCond.Signal()
 			}
 		}
-		time.Sleep(time.Millisecond * time.Duration(rnd(5, 15)))
+		time.Sleep(time.Millisecond * time.Duration(10))
 	}
 }
 
@@ -505,6 +520,8 @@ func (rf *Raft) logCommiter() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := atomic.LoadInt64(&rf.role) == RoleLeader
 
+	DPrintln(Exp2B, Info, "Raft %d receives an agreement request: %v.", rf.me, command)
+
 	// Your code here (2B).
 	if !isLeader {
 		// If not leader, returns false
@@ -514,7 +531,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Starts agreement
 	term := atomic.LoadInt64(&rf.currentTerm)
 	index := rf.localLogAppend(term, command)
-	return index, int(term), isLeader
+
+	DPrintln(Exp2B, Important, "Raft %d starts agreement on term %d, index %d.", rf.me, term, index)
+
+	return index + 1, int(term), isLeader
 }
 
 func (rf *Raft) localLogAppend(term int64, command interface{}) int {
@@ -605,13 +625,11 @@ func (rf *Raft) doSendRequestVote(server int) {
 }
 
 func (rf *Raft) doSendAppendEntries(server int, head int64) bool {
-	rf.logsLock.RLock()
-	defer rf.logsLock.RUnlock()
-
 	// prepare a heartbeat
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 
+	rf.logsLock.RLock()
 	args.Term = atomic.LoadInt64(&rf.currentTerm)
 	args.LeaderId = rf.me
 	if head < 0 {
@@ -627,6 +645,7 @@ func (rf *Raft) doSendAppendEntries(server int, head int64) bool {
 	}
 	args.Entries = rf.logs[head:]
 	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
+	rf.logsLock.RUnlock()
 
 	ok := rf.sendAppendEntries(server, &args, &reply)
 	if !ok {
@@ -634,9 +653,9 @@ func (rf *Raft) doSendAppendEntries(server int, head int64) bool {
 	}
 
 	if !reply.Ok {
-		DPrintln(Exp2A, Warning,
-			"Raft %d: heartbeat (term: %d) rejected by peer %d (term: %d)",
-			rf.me, atomic.LoadInt64(&rf.currentTerm), server, reply.Term)
+		// DPrintln(Exp2A, Warning,
+		// 	"Raft %d: heartbeat (term: %d) rejected by peer %d (term: %d)",
+		// 	rf.me, atomic.LoadInt64(&rf.currentTerm), server, reply.Term)
 	}
 
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
@@ -740,8 +759,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 	rf.applyCh = applyCh
 
 	rf.logs = make([]LogEntry, 0)
@@ -764,7 +783,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 
 	// start commiter
-	go rf.logCommiter()
+	go rf.logCommitter()
 
 	// start log applier
 	rf.applyLock = sync.Mutex{}
