@@ -464,6 +464,10 @@ func (rf *Raft) logReplicator(server int) {
 					DPrintln(Exp2B, Warning, "Raft %d: follower %d rejected log replication (%d to %d)",
 						rf.me, server, nextIndex, lastLogIndex)
 					nextIndex = atomic.AddInt64(&rf.nextIndex[server], -1)
+					if nextIndex < -1 {
+						DPrintln(Exp2B, Error, "Raft %d tries to replicate logs before the first entry!", rf.me)
+					}
+					continue
 				}
 				time.Sleep(time.Millisecond * 10)
 			}

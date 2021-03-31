@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // Debugging
 const Debug = true
@@ -46,6 +49,9 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) (n int, err e
 		params = append(params, color, prefix)
 		params = append(params, a...)
 		fmt.Printf("\x1b[0;%dm  %v"+format+"\x1b[0m\n", params...)
+	}
+	if typ == Error {
+		os.Exit(-1)
 	}
 	return
 }
