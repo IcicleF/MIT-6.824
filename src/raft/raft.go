@@ -52,6 +52,12 @@ func min(x int64, y int64) int64 {
 	return y
 }
 
+const (
+	RPCOk = iota
+	RPCRejected
+	RPCLost
+)
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -249,14 +255,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Transit to new term and follower
 	reply.Term = args.Term
-	atomic.StoreInt64(&rf.role, RoleFollower)
 	if atomic.LoadInt64(&rf.currentTerm) != args.Term {
+		atomic.StoreInt64(&rf.role, RoleFollower)
 		atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
 		atomic.StoreInt64(&rf.votedFor, -1)
 	}
-
-	// Valid request from candidate, update last RPC
-	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
 
 	// 2. If votedFor is null or candidateId, ...
 	vote := atomic.LoadInt64(&rf.votedFor)
@@ -282,6 +285,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// ... grant vote.
 	atomic.StoreInt64(&rf.votedFor, int64(args.CandidateId))
 	reply.Ok = true
+
+	// Valid request from candidate, update last RPC
+	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
 
 	DPrintln(Exp2A, Info, "Raft %d decide to vote for %d in term %d.", rf.me, args.CandidateId, reply.Term)
 }
@@ -441,12 +447,12 @@ func (rf *Raft) logReplicator(server int) {
 			nextIndex := rf.nextIndex[server]
 			rf.indexesLock.RUnlock()
 
-			for lastLogIndex >= int(nextIndex) {
+			for atomic.LoadInt64(&rf.role) == RoleLeader && lastLogIndex >= int(nextIndex) {
 				DPrintln(Exp2B, Info, "Raft %d starts replicating log for %d (last %d >= next %d)",
 					rf.me, server, lastLogIndex, nextIndex)
 
 				ok := rf.doSendAppendEntries(server, nextIndex)
-				if ok {
+				if ok == RPCOk {
 					DPrintln(Exp2B, Info, "Raft %d: follower %d successfully replicated log to %d",
 						rf.me, server, lastLogIndex)
 					rf.indexesLock.Lock()
@@ -454,10 +460,12 @@ func (rf *Raft) logReplicator(server int) {
 					atomic.StoreInt64(&rf.matchIndex[server], int64(lastLogIndex))
 					rf.indexesLock.Unlock()
 					break
+				} else if ok == RPCRejected {
+					DPrintln(Exp2B, Warning, "Raft %d: follower %d rejected log replication (%d to %d)",
+						rf.me, server, nextIndex, lastLogIndex)
+					nextIndex = atomic.AddInt64(&rf.nextIndex[server], -1)
 				}
-				DPrintln(Exp2B, Warning, "Raft %d: follower %d rejected log replication (%d to %d)",
-					rf.me, server, nextIndex, lastLogIndex)
-				nextIndex = atomic.AddInt64(&rf.nextIndex[server], -1)
+				time.Sleep(time.Millisecond * 10)
 			}
 		}
 		time.Sleep(time.Millisecond * 10)
@@ -499,7 +507,7 @@ func (rf *Raft) logCommitter() {
 				rf.applyCond.Signal()
 			}
 		}
-		time.Sleep(time.Millisecond * time.Duration(10))
+		time.Sleep(time.Millisecond * 10)
 	}
 }
 
@@ -520,7 +528,7 @@ func (rf *Raft) logCommitter() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := atomic.LoadInt64(&rf.role) == RoleLeader
 
-	DPrintln(Exp2B, Info, "Raft %d receives an agreement request: %v.", rf.me, command)
+	// DPrintln(Exp2B, Info, "Raft %d receives an agreement request: %v.", rf.me, command)
 
 	// Your code here (2B).
 	if !isLeader {
@@ -624,7 +632,7 @@ func (rf *Raft) doSendRequestVote(server int) {
 	}
 }
 
-func (rf *Raft) doSendAppendEntries(server int, head int64) bool {
+func (rf *Raft) doSendAppendEntries(server int, head int64) int {
 	// prepare a heartbeat
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
@@ -636,34 +644,40 @@ func (rf *Raft) doSendAppendEntries(server int, head int64) bool {
 		head = int64(len(rf.logs))
 	}
 
+	args.PrevLogIndex = head - 1
 	if head == 0 {
-		args.PrevLogIndex = -1
 		args.PrevLogTerm = -1
 	} else {
-		args.PrevLogIndex = head - 1
 		args.PrevLogTerm = rf.logs[head-1].Term
 	}
-	args.Entries = rf.logs[head:]
+	args.Entries = make([]LogEntry, len(rf.logs)-int(head))
+	copy(args.Entries, rf.logs[head:])
 	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
 	rf.logsLock.RUnlock()
 
 	ok := rf.sendAppendEntries(server, &args, &reply)
 	if !ok {
-		return false
+		return RPCLost
 	}
 
+	res := RPCOk
 	if !reply.Ok {
 		// DPrintln(Exp2A, Warning,
 		// 	"Raft %d: heartbeat (term: %d) rejected by peer %d (term: %d)",
 		// 	rf.me, atomic.LoadInt64(&rf.currentTerm), server, reply.Term)
+		res = RPCRejected
 	}
 
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > atomic.LoadInt64(&rf.currentTerm) {
+		DPrintln(Exp2B, Warning, "Raft %d fast-forwards to term %d and convert to follower.", rf.me, reply.Term)
 		atomic.StoreInt64(&rf.role, RoleFollower)
 		atomic.StoreInt64(&rf.currentTerm, int64(reply.Term))
+
+		// Reset RPC ticker
+		atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
 	}
-	return reply.Ok
+	return res
 }
 
 // The ticker go routine starts a new election if this peer hasn't received

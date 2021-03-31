@@ -31,12 +31,12 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) (n int, err e
 		case Raw:
 			prefix = ""
 		case Info:
-			prefix = "[INFO] "
+			prefix = "[INFO]   "
 		case Important:
 			prefix = "[INFO !] "
 			color = 1
 		case Warning:
-			prefix = "[WARN] "
+			prefix = "[WARN]   "
 			color = 33
 		case Error:
 			prefix = "[ERR]  "
