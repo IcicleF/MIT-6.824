@@ -19,7 +19,9 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"crypto/rand"
+	"fmt"
 	"math/big"
 	"sort"
 	"sync"
@@ -27,11 +29,13 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
-const TimeoutMin = 500
-const TimeoutMax = 700
+const TimeoutMin = 300
+const TimeoutMax = 600
+const TimeoutHeartbeat = 100
 
 // randomizer
 func rnd(min int, max int) int {
@@ -120,6 +124,9 @@ type Raft struct {
 	applyCh   chan ApplyMsg
 	applyLock sync.Mutex
 	applyCond sync.Cond
+
+	appendEntriesLock     sync.Mutex
+	sendAppendEntriesLock sync.Mutex
 }
 
 const (
@@ -145,6 +152,14 @@ func (rf *Raft) initFollowerIndexes() {
 	}
 }
 
+func (rf *Raft) fastForwardToTerm(term int64) {
+	atomic.StoreInt64(&rf.role, RoleFollower)
+	atomic.StoreInt64(&rf.currentTerm, term)
+	atomic.StoreInt64(&rf.votedFor, -1)
+	rf.persist(false)
+	atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -157,20 +172,67 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) PrintState() {
+	var role int64
+	var currentTerm int64
+	var logLen int
+	var lastLogTerm int64
+
+	role = atomic.LoadInt64(&rf.role)
+	currentTerm = atomic.LoadInt64(&rf.currentTerm)
+
+	rf.logsLock.RLock()
+	logLen = len(rf.logs)
+	lastLogTerm = -1
+	if logLen > 0 {
+		lastLogTerm = rf.logs[logLen-1].Term
+	}
+	rf.logsLock.RUnlock()
+
+	roleStr := ""
+	switch role {
+	case RoleCandidate:
+		roleStr = "CANDIDATE"
+	case RoleFollower:
+		roleStr = "FOLLOWER "
+	case RoleLeader:
+		roleStr = "LEADER   "
+	}
+
+	fmt.Printf("Raft %d: %v  term = %d  last log entry (term %d, index %d)\n",
+		rf.me, roleStr, currentTerm, lastLogTerm, logLen-1)
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persist(hasLock bool) {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	currentTerm := atomic.LoadInt64(&rf.currentTerm)
+	votedFor := atomic.LoadInt64(&rf.votedFor)
+
+	if !hasLock {
+		rf.logsLock.RLock()
+	}
+	logs := make([]LogEntry, len(rf.logs))
+	copy(logs, rf.logs)
+	if !hasLock {
+		rf.logsLock.RUnlock()
+	}
+
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	enc.Encode(currentTerm)
+	enc.Encode(votedFor)
+	enc.Encode(logs)
+
+	data := buf.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	DPrintln(Exp2C, Log, "Raft %d encoded state {term = %d, vote = %d, log = %v}.",
+		rf.me, currentTerm, votedFor, logs)
 }
 
 //
@@ -178,21 +240,31 @@ func (rf *Raft) persist() {
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		rf.currentTerm = 0
+		rf.votedFor = -1
+		rf.logs = make([]LogEntry, 0)
 		return
 	}
+
+	DPrintln(Exp2C, Log, "Raft %d begins decoding data from persistent memory.", rf.me)
+
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	buf := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(buf)
+
+	var currentTerm int64 = 0
+	var votedFor int64 = -1
+	var logs []LogEntry
+	if dec.Decode(&currentTerm) != nil || dec.Decode(&votedFor) != nil || dec.Decode(&logs) != nil {
+		DPrintln(Exp2C, Error, "Raft %d cannot decode persistent data!")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
+
+	DPrintln(Exp2C, Log, "Raft %d successfully decoded {term = %d, vote = %d, log = %v}.",
+		rf.me, currentTerm, votedFor, logs)
 }
 
 //
@@ -254,12 +326,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// Transit to new term and follower
-	reply.Term = args.Term
-	if atomic.LoadInt64(&rf.currentTerm) != args.Term {
-		atomic.StoreInt64(&rf.role, RoleFollower)
-		atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
-		atomic.StoreInt64(&rf.votedFor, -1)
+	if args.Term > reply.Term {
+		rf.fastForwardToTerm(args.Term)
 	}
+	reply.Term = args.Term
 
 	// 2. If votedFor is null or candidateId, ...
 	vote := atomic.LoadInt64(&rf.votedFor)
@@ -337,11 +407,15 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Ok   bool
-	Term int64
+	Ok       bool
+	Term     int64
+	MyLogLen int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.appendEntriesLock.Lock()
+	defer rf.appendEntriesLock.Unlock()
+
 	reply.Term = atomic.LoadInt64(&rf.currentTerm)
 
 	// 1. Reply false if term < currentTerm
@@ -357,7 +431,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintln(Exp2A, Important, "Raft %d reverts from leader to follower", rf.me)
 	}
 	atomic.StoreInt64(&rf.role, RoleFollower)
-	atomic.StoreInt64(&rf.currentTerm, int64(args.Term))
+	if args.Term > reply.Term {
+		rf.fastForwardToTerm(args.Term)
+	}
+
 	reply.Term = args.Term
 
 	// Valid request from leader, update related variables
@@ -376,6 +453,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.logsLock.RUnlock()
 
+	reply.MyLogLen = logLen
 	if !phase2Flag {
 		if len(args.Entries) != 0 {
 			DPrintln(Exp2B, Warning,
@@ -394,6 +472,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.logsLock.Lock()
 	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 	lastEntry := len(rf.logs) - 1
+	rf.persist(true) // logs changed
 	rf.logsLock.Unlock()
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -436,6 +515,49 @@ func (rf *Raft) logApplier() {
 	}
 }
 
+func (rf *Raft) doRemoteAppendEntriesUntilSuccess(server int, lastLogIndex int) {
+	rf.indexesLock.RLock()
+	nextIndex := rf.nextIndex[server]
+	rf.indexesLock.RUnlock()
+
+	for !rf.killed() && atomic.LoadInt64(&rf.role) == RoleLeader && (lastLogIndex < 0 || lastLogIndex >= int(nextIndex)) {
+		if lastLogIndex >= 0 {
+			DPrintln(Exp2B, Info, "Raft %d starts replicating log for %d (last %d >= next %d)",
+				rf.me, server, lastLogIndex, nextIndex)
+		}
+
+		ok, logLen, replicatedUntil := rf.doSendAppendEntries(server, nextIndex)
+		if ok == RPCOk {
+			DPrintln(Exp2B, Info, "Raft %d: follower %d successfully replicated log to %d",
+				rf.me, server, replicatedUntil)
+			rf.indexesLock.Lock()
+			atomic.StoreInt64(&rf.nextIndex[server], int64(replicatedUntil+1))
+			atomic.StoreInt64(&rf.matchIndex[server], int64(replicatedUntil))
+			rf.indexesLock.Unlock()
+			break
+		} else if ok == RPCRejected {
+			DPrintln(Exp2B, Warning, "Raft %d: follower %d rejected log replication (%d to %d)",
+				rf.me, server, nextIndex, lastLogIndex)
+
+			rf.indexesLock.Lock()
+			if int(nextIndex) > logLen {
+				// nextIndex fast-backwarding
+				nextIndex = int64(logLen - 1)
+				atomic.StoreInt64(&rf.nextIndex[server], nextIndex)
+			} else {
+				nextIndex = atomic.AddInt64(&rf.nextIndex[server], -1)
+			}
+			rf.indexesLock.Unlock()
+
+			if nextIndex < -1 {
+				DPrintln(Exp2B, Error, "Raft %d tries to replicate logs before the first entry!", rf.me)
+			}
+			continue
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+}
+
 func (rf *Raft) logReplicator(server int) {
 	for !rf.killed() {
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
@@ -443,34 +565,7 @@ func (rf *Raft) logReplicator(server int) {
 			lastLogIndex := len(rf.logs) - 1
 			rf.logsLock.RUnlock()
 
-			rf.indexesLock.RLock()
-			nextIndex := rf.nextIndex[server]
-			rf.indexesLock.RUnlock()
-
-			for atomic.LoadInt64(&rf.role) == RoleLeader && lastLogIndex >= int(nextIndex) {
-				DPrintln(Exp2B, Info, "Raft %d starts replicating log for %d (last %d >= next %d)",
-					rf.me, server, lastLogIndex, nextIndex)
-
-				ok := rf.doSendAppendEntries(server, nextIndex)
-				if ok == RPCOk {
-					DPrintln(Exp2B, Info, "Raft %d: follower %d successfully replicated log to %d",
-						rf.me, server, lastLogIndex)
-					rf.indexesLock.Lock()
-					atomic.StoreInt64(&rf.nextIndex[server], int64(lastLogIndex+1))
-					atomic.StoreInt64(&rf.matchIndex[server], int64(lastLogIndex))
-					rf.indexesLock.Unlock()
-					break
-				} else if ok == RPCRejected {
-					DPrintln(Exp2B, Warning, "Raft %d: follower %d rejected log replication (%d to %d)",
-						rf.me, server, nextIndex, lastLogIndex)
-					nextIndex = atomic.AddInt64(&rf.nextIndex[server], -1)
-					if nextIndex < -1 {
-						DPrintln(Exp2B, Error, "Raft %d tries to replicate logs before the first entry!", rf.me)
-					}
-					continue
-				}
-				time.Sleep(time.Millisecond * 10)
-			}
+			rf.doRemoteAppendEntriesUntilSuccess(server, lastLogIndex)
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
@@ -496,12 +591,15 @@ func (rf *Raft) logCommitter() {
 			// Find the matchIndex majority
 			sort.Ints(matchIndex)
 			majorityMatched := matchIndex[len(rf.peers)-majority(len(rf.peers))]
+			if majorityMatched >= len(rf.logs) {
+				majorityMatched = len(rf.logs) - 1
+			}
 
 			// N > commitIndex ...
 			ok := majorityMatched > int(atomic.LoadInt64(&rf.commitIndex))
 
 			// ... and log[N].term == currentTerm
-			ok = ok && rf.logs[majorityMatched].Term == atomic.LoadInt64(&rf.currentTerm)
+			ok = ok && (rf.logs[majorityMatched].Term == atomic.LoadInt64(&rf.currentTerm))
 			rf.logsLock.RUnlock()
 
 			// Set commitIndex = N
@@ -555,6 +653,8 @@ func (rf *Raft) localLogAppend(term int64, command interface{}) int {
 
 	l := len(rf.logs)
 	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+	rf.persist(true)
+
 	return l
 }
 
@@ -593,7 +693,8 @@ func (rf *Raft) broadcast(kind int) {
 		case BroadcastRequestVote:
 			go rf.doSendRequestVote(i)
 		case BroadcastHeartbeat:
-			go rf.doSendAppendEntries(i, -1)
+			// DPrintln(Exp2A, Info, "Raft %d sending heartbeat to %d.", rf.me, i)
+			go rf.doRemoteAppendEntriesUntilSuccess(i, -1)
 		}
 	}
 }
@@ -631,21 +732,24 @@ func (rf *Raft) doSendRequestVote(server int) {
 
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > atomic.LoadInt64(&rf.currentTerm) {
-		atomic.StoreInt64(&rf.role, RoleFollower)
-		atomic.StoreInt64(&rf.currentTerm, int64(reply.Term))
+		rf.fastForwardToTerm(reply.Term)
 	}
 }
 
-func (rf *Raft) doSendAppendEntries(server int, head int64) int {
-	// prepare a heartbeat
+// Returns (RPCStatus, RemoteLogLen, LocalReplicatedLogEnd)
+func (rf *Raft) doSendAppendEntries(server int, head int64) (int, int, int) {
+	rf.sendAppendEntriesLock.Lock()
+	defer rf.sendAppendEntriesLock.Unlock()
+
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 
 	rf.logsLock.RLock()
 	args.Term = atomic.LoadInt64(&rf.currentTerm)
 	args.LeaderId = rf.me
+	logLen := len(rf.logs)
 	if head < 0 {
-		head = int64(len(rf.logs))
+		head = int64(logLen)
 	}
 
 	args.PrevLogIndex = head - 1
@@ -654,14 +758,15 @@ func (rf *Raft) doSendAppendEntries(server int, head int64) int {
 	} else {
 		args.PrevLogTerm = rf.logs[head-1].Term
 	}
-	args.Entries = make([]LogEntry, len(rf.logs)-int(head))
-	copy(args.Entries, rf.logs[head:])
-	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
+	args.Entries = make([]LogEntry, logLen-int(head))
+	copy(args.Entries, rf.logs[head:logLen])
 	rf.logsLock.RUnlock()
+
+	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
 
 	ok := rf.sendAppendEntries(server, &args, &reply)
 	if !ok {
-		return RPCLost
+		return RPCLost, 0, -1
 	}
 
 	res := RPCOk
@@ -675,13 +780,9 @@ func (rf *Raft) doSendAppendEntries(server int, head int64) int {
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > atomic.LoadInt64(&rf.currentTerm) {
 		DPrintln(Exp2B, Warning, "Raft %d fast-forwards to term %d and convert to follower.", rf.me, reply.Term)
-		atomic.StoreInt64(&rf.role, RoleFollower)
-		atomic.StoreInt64(&rf.currentTerm, int64(reply.Term))
-
-		// Reset RPC ticker
-		atomic.StoreInt64(&rf.lastRPC, time.Now().UnixNano())
+		rf.fastForwardToTerm(reply.Term)
 	}
-	return res
+	return res, reply.MyLogLen, (logLen - 1)
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -735,7 +836,7 @@ func (rf *Raft) ticker() {
 						rf.broadcast(BroadcastHeartbeat)
 					}
 				}
-				// (a) I win the election
+				// (a) I win the election; or
 				// (b) another server establishes itself as leader
 				if atomic.LoadInt64(&rf.role) != RoleCandidate {
 					break
@@ -752,7 +853,7 @@ func (rf *Raft) heart() {
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
 			rf.broadcast(BroadcastHeartbeat)
 		}
-		time.Sleep(time.Millisecond * 100)
+		time.Sleep(time.Millisecond * TimeoutHeartbeat)
 	}
 }
 
@@ -775,13 +876,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
-	rf.votedFor = -1
+	// Initialize persistent state
+	rf.readPersist(persister.ReadRaftState())
+
+	// Initialize volatile state
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.applyCh = applyCh
-
-	rf.logs = make([]LogEntry, 0)
 
 	atomic.StoreInt64(&rf.role, RoleFollower)
 	rf.lastRPC = time.Now().UnixNano()

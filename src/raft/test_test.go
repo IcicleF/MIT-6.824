@@ -850,6 +850,14 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
+	for j := 0; j < 10; j++ {
+		for i := 0; i < servers; i++ {
+			cfg.rafts[i].PrintState();
+		}
+		fmt.Println()
+		time.Sleep(time.Second)
+	}
+
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()
