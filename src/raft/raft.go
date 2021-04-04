@@ -183,7 +183,7 @@ func (rf *Raft) fastForwardToTerm(term int64) {
 	rf.currentTerm = term
 	atomic.StoreInt64(&rf.role, RoleFollower)
 	rf.votedFor = -1
-	rf.persist(false)
+	rf.persist()
 	rf.persistentLock.Unlock()
 
 	rf.lastRPC.Set()
@@ -256,18 +256,12 @@ func (rf *Raft) PrintState() {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist(needLock bool) {
+func (rf *Raft) persist() {
 	// Your code here (2C).
-	if needLock {
-		rf.persistentLock.RLock()
-	}
 	currentTerm := rf.currentTerm
 	votedFor := rf.votedFor
 	logs := make([]LogEntry, len(rf.logs))
 	copy(logs, rf.logs)
-	if needLock {
-		rf.persistentLock.RUnlock()
-	}
 
 	buf := new(bytes.Buffer)
 	enc := labgob.NewEncoder(buf)
@@ -528,7 +522,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persistentLock.Lock()
 	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 	lastEntry := len(rf.logs) - 1
-	rf.persist(false) // logs changed
+	rf.persist() // logs changed
 	rf.persistentLock.Unlock()
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -598,7 +592,10 @@ func (rf *Raft) logReplicator(server int) {
 
 			continuousRejects := 0
 			for !rf.killed() && atomic.LoadInt64(&rf.role) == RoleLeader {
-				ok, logLen, replUntil := rf.doSendAppendEntries(server, atomic.LoadInt64(&rf.currentTerm), nextIndex)
+				rf.persistentLock.RLock()
+				term := rf.currentTerm
+				rf.persistentLock.RUnlock()
+				ok, logLen, replUntil := rf.doSendAppendEntries(server, term, nextIndex)
 				if atomic.LoadInt64(&rf.role) != RoleLeader {
 					break
 				}
@@ -635,7 +632,8 @@ func (rf *Raft) logReplicator(server int) {
 					rf.indexesLock.Unlock()
 
 					if nextIndex < 0 {
-						DPrintln(Exp2B, Error, "Raft %d tries to replicate logs to %d before the first entry (nextIndex = %d)!",
+						DPrintln(Exp2B, Error,
+							"Raft %d tries to replicate logs to %d before the first entry (nextIndex = %d)!",
 							rf.me, server, nextIndex)
 					}
 					continue
@@ -721,7 +719,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	index := len(rf.logs)
 	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
-	rf.persist(false)
+	rf.persist()
 
 	DPrintln(Exp2B, Info, "Raft %d starts agreement on term %d, index %d.", rf.me, term, index)
 
@@ -888,7 +886,7 @@ func (rf *Raft) ticker() {
 				term := rf.currentTerm
 				atomic.StoreInt64(&rf.role, RoleCandidate)
 				rf.votedFor = int64(rf.me)
-				rf.persist(false)
+				rf.persist()
 				rf.persistentLock.Unlock()
 
 				DPrintln(Exp2A, Important, "Raft %d starts election at term %d!", rf.me, term)
