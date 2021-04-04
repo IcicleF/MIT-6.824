@@ -27,8 +27,8 @@ const (
 )
 
 const ShownLogLevel = Info
-const ShownPhase = Exp2ABC
-const CancelColoring = true
+const ShownPhase = 0
+const CancelColoring = false
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
 	if typ == Error || (Debug && ((phase & ShownPhase) != 0) && typ >= ShownLogLevel) {

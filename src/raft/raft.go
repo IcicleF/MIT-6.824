@@ -35,6 +35,8 @@ import (
 
 const TimeoutMin = 300
 const TimeoutMax = 600
+const ExtendedTimeoutMin = 900
+const ExtendedTimeoutMax = 1200
 const TimeoutHeartbeat = 100
 
 // randomizer
@@ -57,10 +59,10 @@ func min(x int64, y int64) int64 {
 }
 
 const (
-	RPCOk = iota
-	RPCRejected
-	RPCLost
-	RPCRetracted
+	RPCOk        = iota // Remote accepts the RPC
+	RPCRejected         // Remote rejects the RPC
+	RPCLost             // RPC Call function returns false
+	RPCRetracted        // This node regards the RPC as rejected for some reason
 )
 
 //
@@ -147,6 +149,7 @@ type Raft struct {
 	role          int64     // my role
 	lastRPC       Timestamp // last RPC received
 	receivedVotes int64     // my votes in an election
+	rejectedVotes int64     // rejected RequestVotes
 
 	applyCh   chan ApplyMsg // apply messages
 	applyLock sync.Mutex    // apply lock
@@ -793,7 +796,7 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > args.Term {
 		rf.fastForwardToTerm(reply.Term)
-		return RPCRejected
+		return RPCRetracted
 	}
 
 	// Need to verify that I am still a candidate
@@ -805,6 +808,9 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 		atomic.AddInt64(&rf.receivedVotes, 1)
 		return RPCOk
 	}
+
+	// The RequestVote is rejected because of log unmatch
+	atomic.AddInt64(&rf.rejectedVotes, 1)
 	return RPCRejected
 }
 
@@ -878,6 +884,8 @@ func (rf *Raft) ticker() {
 				continue
 			}
 
+			atomic.StoreInt64(&rf.rejectedVotes, 0)
+
 			// repeat election until I am not a candidate
 			for !rf.killed() {
 				rf.persistentLock.Lock()
@@ -890,16 +898,24 @@ func (rf *Raft) ticker() {
 
 				DPrintln(Exp2A, Important, "Raft %d starts election at term %d!", rf.me, term)
 
+				timeout := time.Millisecond * time.Duration(rnd(TimeoutMin, TimeoutMax))
+				if atomic.LoadInt64(&rf.rejectedVotes) > 0 {
+					// Other server possesses newer log than me, wait longer
+					timeout = time.Millisecond * time.Duration(rnd(ExtendedTimeoutMin, ExtendedTimeoutMax))
+				}
+
 				atomic.StoreInt64(&rf.receivedVotes, 1)
+				atomic.StoreInt64(&rf.rejectedVotes, 0)
 				rf.broadcast(BroadcastRequestVote, term)
 
-				timeout := time.Millisecond * time.Duration(rnd(TimeoutMin, TimeoutMax))
 				startTime := time.Now()
 				// as long as I am still a candidate
 				for !rf.killed() && atomic.LoadInt64(&rf.role) == RoleCandidate {
 					if time.Since(startTime) > timeout {
 						// (c) a period of time goes by no winner
 						//  -> abort and go to next term
+						DPrintln(Exp2B|Exp2C, Warning, "Raft %d withdraws election in term %d for timeout.",
+							rf.me, term)
 						break
 					}
 
