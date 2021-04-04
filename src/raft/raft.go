@@ -122,7 +122,6 @@ func (at *Timestamp) Since() time.Duration {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -863,7 +862,7 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, in
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
@@ -880,7 +879,7 @@ func (rf *Raft) ticker() {
 			}
 
 			// repeat election until I am not a candidate
-			for rf.killed() == false {
+			for !rf.killed() {
 				rf.persistentLock.Lock()
 				rf.currentTerm++
 				term := rf.currentTerm
@@ -927,7 +926,7 @@ func (rf *Raft) ticker() {
 
 // The heart is responsible to send out heartbeats when I am leader.
 func (rf *Raft) heart() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		term, role := rf.GetTermAndRole()
 		if role == RoleLeader {
 			rf.broadcast(BroadcastHeartbeat, term)

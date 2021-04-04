@@ -27,7 +27,8 @@ const (
 )
 
 const ShownLogLevel = Info
-const ShownPhase = 0
+const ShownPhase = Exp2ABC
+const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
 	if typ == Error || (Debug && ((phase & ShownPhase) != 0) && typ >= ShownLogLevel) {
@@ -50,13 +51,22 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) {
 			color = 31
 		}
 		params := make([]interface{}, 0)
-		params = append(params, color, prefix)
-		params = append(params, a...)
-		fmt.Printf("\x1b[0;%dm  %v"+format+"\x1b[0m\n", params...)
+		if CancelColoring {
+			params = append(params, prefix)
+			params = append(params, a...)
+			fmt.Printf("  %v"+format+"\n", params...)
+		} else {
+			params = append(params, color, prefix)
+			params = append(params, a...)
+			fmt.Printf("\x1b[0;%dm  %v"+format+"\x1b[0m\n", params...)
+		}
 	}
 	if typ == Error {
-		fmt.Printf("\x1b[0;31m*** Exit because of unexpected situation. ***\x1b[0m\n\n")
+		if CancelColoring {
+			fmt.Printf("*** Exit because of unexpected situation. ***\n\n")
+		} else {
+			fmt.Printf("\x1b[0;31m*** Exit because of unexpected situation. ***\x1b[0m\n\n")
+		}
 		os.Exit(-1)
 	}
-	return
 }
