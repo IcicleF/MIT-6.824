@@ -11,9 +11,9 @@ const Debug = true
 const (
 	Log = iota
 	Info
+	Important
 	Warning
 	Error
-	Important
 	None
 
 	Exp2A = 0x1
@@ -26,11 +26,11 @@ const (
 	Exp2    = 0xF
 )
 
-const ShownLogLevel = Info
-const ShownPhase = Exp2A
+const ShownLogLevel = Log
+const ShownPhase = Exp2AB
 
-func DPrintln(phase int, typ int, format string, a ...interface{}) (n int, err error) {
-	if typ == Error || ((Debug && ((phase & ShownPhase) != 0)) && typ >= ShownLogLevel) {
+func DPrintln(phase int, typ int, format string, a ...interface{}) {
+	if typ == Error || (Debug && ((phase & ShownPhase) != 0) && typ >= ShownLogLevel) {
 		var prefix string
 		var color int = 0
 
