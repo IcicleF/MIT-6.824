@@ -119,6 +119,7 @@ func (at *Timestamp) Since() time.Duration {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
+	mu        sync.RWMutex        // provide atomic access to persistent info
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -127,10 +128,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm    int64        // last term server has seen
-	votedFor       int64        // candidate ID that received vote in current term
-	logs           []LogEntry   // log entry array
-	persistentLock sync.RWMutex // provide atomic access to persistent info
+	currentTerm int64      // last term server has seen
+	votedFor    int        // candidate ID that received vote in current term
+	logs        []LogEntry // log entry array
 
 	commitIndex int64 // index of highest log entry known to be commited
 	lastApplied int64 // index of highest log entry applied to state machine
@@ -157,9 +157,9 @@ const (
 )
 
 func (rf *Raft) initFollowerIndexes() {
-	rf.persistentLock.RLock()
+	rf.mu.RLock()
 	nextInd := len(rf.logs)
-	rf.persistentLock.RUnlock()
+	rf.mu.RUnlock()
 
 	rf.indexesLock.Lock()
 	defer rf.indexesLock.Unlock()
@@ -174,20 +174,25 @@ func (rf *Raft) initFollowerIndexes() {
 
 func (rf *Raft) fastForwardToTerm(term int64, needLock bool) {
 	if needLock {
-		rf.persistentLock.Lock()
-		defer rf.persistentLock.Unlock()
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
 	}
+	if term <= rf.currentTerm {
+		return
+	}
+
 	rf.currentTerm = term
 	atomic.StoreInt64(&rf.role, RoleFollower)
 	rf.votedFor = -1
+	// DPrintln(Exp2C, Warning, "Raft %d setting votedFor = -1", rf.me)
 	rf.persist()
 
 	rf.lastRPC.Set()
 }
 
 func (rf *Raft) GetTermAndRole() (int64, int64) {
-	rf.persistentLock.RLock()
-	defer rf.persistentLock.RUnlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 
 	return rf.currentTerm, atomic.LoadInt64(&rf.role)
 }
@@ -207,7 +212,7 @@ func (rf *Raft) PrintState() {
 	var logLen int
 	var lastLogTerm int64
 
-	rf.persistentLock.RLock()
+	rf.mu.RLock()
 	currentTerm = rf.currentTerm
 	role = rf.role
 	logLen = len(rf.logs)
@@ -215,7 +220,7 @@ func (rf *Raft) PrintState() {
 	if logLen > 0 {
 		lastLogTerm = rf.logs[logLen-1].Term
 	}
-	rf.persistentLock.RUnlock()
+	rf.mu.RUnlock()
 
 	roleStr := ""
 	switch role {
@@ -238,22 +243,18 @@ func (rf *Raft) PrintState() {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	currentTerm := rf.currentTerm
-	votedFor := rf.votedFor
-	logs := make([]LogEntry, len(rf.logs))
-	copy(logs, rf.logs)
 
 	buf := new(bytes.Buffer)
 	enc := labgob.NewEncoder(buf)
-	enc.Encode(currentTerm)
-	enc.Encode(votedFor)
-	enc.Encode(logs)
+	enc.Encode(rf.currentTerm)
+	enc.Encode(rf.votedFor)
+	enc.Encode(rf.logs)
 
 	data := buf.Bytes()
 	rf.persister.SaveRaftState(data)
 
 	DPrintln(Exp2C, Log, "Raft %d encoded state {term = %d, vote = %d, log = %v}.",
-		rf.me, currentTerm, votedFor, logs)
+		rf.me, rf.currentTerm, rf.votedFor, rf.logs)
 }
 
 //
@@ -263,6 +264,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		rf.currentTerm = 0
 		rf.votedFor = -1
+		// DPrintln(Exp2C, Warning, "Raft %d setting votedFor = -1", rf.me)
 		rf.logs = make([]LogEntry, 0)
 		return
 	}
@@ -273,19 +275,12 @@ func (rf *Raft) readPersist(data []byte) {
 	buf := bytes.NewBuffer(data)
 	dec := labgob.NewDecoder(buf)
 
-	var currentTerm int64 = 0
-	var votedFor int64 = -1
-	var logs []LogEntry
-	if dec.Decode(&currentTerm) != nil || dec.Decode(&votedFor) != nil || dec.Decode(&logs) != nil {
+	if dec.Decode(&rf.currentTerm) != nil || dec.Decode(&rf.votedFor) != nil || dec.Decode(&rf.logs) != nil {
 		DPrintln(Exp2C, Error, "Raft %d cannot decode persistent data!")
-	} else {
-		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
-		rf.logs = logs
 	}
 
-	DPrintln(Exp2C, Log, "Raft %d successfully decoded {term = %d, vote = %d, log = %v}.",
-		rf.me, currentTerm, votedFor, logs)
+	DPrintln(Exp2C, Info, "Raft %d successfully decoded {term = %d, vote = %d, log = %v}.",
+		rf.me, rf.currentTerm, rf.votedFor, rf.logs)
 }
 
 //
@@ -334,11 +329,10 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.persistentLock.Lock()
-	defer rf.persistentLock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	DPrintln(Exp2A, Log, "Raft %d received RequestVote from %d with term %d.",
-		rf.me, args.CandidateId, args.Term)
+	DPrintln(Exp2A, Info, "Raft %d received RequestVote from %d with term %d.", rf.me, args.CandidateId, args.Term)
 
 	var localLastLogTerm int64 = -1
 	localLastLogIndex := len(rf.logs) - 1
@@ -356,7 +350,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// Transit to new term and follower
-	if args.Term > reply.Term {
+	if args.Term > rf.currentTerm {
 		rf.fastForwardToTerm(args.Term, false)
 	}
 	reply.Term = rf.currentTerm
@@ -368,15 +362,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// ... grant vote.
-	if rf.votedFor == -1 || rf.votedFor == int64(args.CandidateId) {
-		// Needs atomic checking
-		rf.votedFor = int64(args.CandidateId)
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
 		reply.Ok = true
+
+		// votedFor changed
+		rf.persist()
 
 		// Valid request from candidate, update last RPC
 		rf.lastRPC.Set()
 
-		DPrintln(Exp2A, Info, "Raft %d decide to vote for %d in term %d.", rf.me, args.CandidateId, reply.Term)
+		DPrintln(Exp2A, Info, "Raft %d decided to vote for %d in term %d.", rf.me, args.CandidateId, reply.Term)
 	} else {
 		reply.Ok = false
 	}
@@ -434,8 +430,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.persistentLock.Lock()
-	defer rf.persistentLock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	DPrintln(Exp2AB, Log, "Raft %d received AppendEntries from %d.", rf.me, args.LeaderId)
 
@@ -532,9 +528,9 @@ func (rf *Raft) logApplier() {
 		rf.lastApplied++
 		applyIndex := rf.lastApplied
 
-		rf.persistentLock.RLock()
+		rf.mu.RLock()
 		entry := rf.logs[applyIndex]
-		rf.persistentLock.RUnlock()
+		rf.mu.RUnlock()
 
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -554,9 +550,9 @@ func (rf *Raft) logReplicator(server int) {
 	for !rf.killed() {
 		time.Sleep(time.Millisecond * 10)
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
-			rf.persistentLock.RLock()
+			rf.mu.RLock()
 			lastLogIndex := len(rf.logs) - 1
-			rf.persistentLock.RUnlock()
+			rf.mu.RUnlock()
 
 			rf.indexesLock.RLock()
 			nextIndex := rf.nextIndex[server]
@@ -574,10 +570,10 @@ func (rf *Raft) logReplicator(server int) {
 
 			continuousRejects := 0
 			for !rf.killed() {
-				rf.persistentLock.RLock()
+				rf.mu.RLock()
 				term := rf.currentTerm
 				role := atomic.LoadInt64(&rf.role)
-				rf.persistentLock.RUnlock()
+				rf.mu.RUnlock()
 
 				if role != RoleLeader {
 					break
@@ -639,7 +635,7 @@ func (rf *Raft) logCommitter() {
 			matchIndex := make([]int, len(rf.peers))
 
 			// Copy matchIndex
-			rf.persistentLock.RLock()
+			rf.mu.RLock()
 			rf.indexesLock.RLock()
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
@@ -662,7 +658,7 @@ func (rf *Raft) logCommitter() {
 
 			// ... and log[N].term == currentTerm
 			ok = ok && (rf.logs[majorityMatched].Term == rf.currentTerm)
-			rf.persistentLock.RUnlock()
+			rf.mu.RUnlock()
 
 			// Set commitIndex = N
 			if ok {
@@ -691,6 +687,9 @@ func (rf *Raft) logCommitter() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	isLeader := atomic.LoadInt64(&rf.role) == RoleLeader
 
 	// DPrintln(Exp2B, Info, "Raft %d receives an agreement request: %v.", rf.me, command)
@@ -702,9 +701,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// Starts agreement
-	rf.persistentLock.Lock()
-	defer rf.persistentLock.Unlock()
-
 	term := rf.currentTerm
 	index := len(rf.logs)
 	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
@@ -766,14 +762,14 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 	args.Term = term
 	args.CandidateId = rf.me
 
-	rf.persistentLock.RLock()
+	rf.mu.RLock()
 	args.LastLogIndex = int64(len(rf.logs) - 1)
 	if args.LastLogIndex < 0 {
 		args.LastLogTerm = -1
 	} else {
 		args.LastLogTerm = rf.logs[args.LastLogIndex].Term
 	}
-	rf.persistentLock.RUnlock()
+	rf.mu.RUnlock()
 
 	ok := rf.sendRequestVote(server, &args, &reply)
 	if !ok {
@@ -807,7 +803,7 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, in
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 
-	rf.persistentLock.RLock()
+	rf.mu.RLock()
 	args.Term = term
 	args.LeaderId = rf.me
 	logLen := len(rf.logs)
@@ -823,7 +819,7 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, in
 	}
 	args.Entries = make([]LogEntry, logLen-int(head))
 	copy(args.Entries, rf.logs[head:logLen])
-	rf.persistentLock.RUnlock()
+	rf.mu.RUnlock()
 
 	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
 
@@ -871,13 +867,13 @@ func (rf *Raft) ticker() {
 
 			// repeat election until I am not a candidate
 			for !rf.killed() {
-				rf.persistentLock.Lock()
+				rf.mu.Lock()
 				rf.currentTerm++
 				term := rf.currentTerm
 				atomic.StoreInt64(&rf.role, RoleCandidate)
-				rf.votedFor = int64(rf.me)
+				rf.votedFor = rf.me
 				rf.persist()
-				rf.persistentLock.Unlock()
+				rf.mu.Unlock()
 
 				DPrintln(Exp2A, Important, "Raft %d starts election at term %d!", rf.me, term)
 
