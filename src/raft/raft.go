@@ -35,8 +35,6 @@ import (
 
 const TimeoutMin = 300
 const TimeoutMax = 600
-const ExtendedTimeoutMin = 900
-const ExtendedTimeoutMax = 1200
 const TimeoutHeartbeat = 100
 
 // randomizer
@@ -149,7 +147,6 @@ type Raft struct {
 	role          int64     // my role
 	lastRPC       Timestamp // last RPC received
 	receivedVotes int64     // my votes in an election
-	rejectedVotes int64     // rejected RequestVotes
 
 	applyCh   chan ApplyMsg // apply messages
 	applyLock sync.Mutex    // apply lock
@@ -522,9 +519,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3. If an existing entry conflicts with a new one, delete the existing entry and all that follows it
 	// 4. Append any new entries not already in the log
 	rf.persistentLock.Lock()
-	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 	lastEntry := len(rf.logs) - 1
-	rf.persist() // logs changed
+	if len(args.Entries) > 0 {
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		lastEntry = len(rf.logs) - 1
+		rf.persist() // logs changed
+	}
 	rf.persistentLock.Unlock()
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -593,12 +593,18 @@ func (rf *Raft) logReplicator(server int) {
 			}
 
 			continuousRejects := 0
-			for !rf.killed() && atomic.LoadInt64(&rf.role) == RoleLeader {
+			for !rf.killed() {
 				rf.persistentLock.RLock()
 				term := rf.currentTerm
+				role := atomic.LoadInt64(&rf.role)
 				rf.persistentLock.RUnlock()
+
+				if role != RoleLeader {
+					break
+				}
+
 				ok, logLen, replUntil := rf.doSendAppendEntries(server, term, nextIndex)
-				if atomic.LoadInt64(&rf.role) != RoleLeader {
+				if ok == RPCRetracted {
 					break
 				}
 
@@ -810,7 +816,6 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 	}
 
 	// The RequestVote is rejected because of log unmatch
-	atomic.AddInt64(&rf.rejectedVotes, 1)
 	return RPCRejected
 }
 
@@ -851,9 +856,8 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, in
 	if reply.Term > args.Term {
 		DPrintln(Exp2B, Warning, "Raft %d fast-forwards to term %d and convert to follower.", rf.me, reply.Term)
 		rf.fastForwardToTerm(reply.Term)
-	}
-
-	if !reply.Ok {
+		res = RPCRetracted
+	} else if !reply.Ok {
 		// DPrintln(Exp2A, Warning,
 		// 	"Raft %d: heartbeat (term: %d) rejected by peer %d (term: %d)",
 		// 	rf.me, atomic.LoadInt64(&rf.currentTerm), server, reply.Term)
@@ -884,8 +888,6 @@ func (rf *Raft) ticker() {
 				continue
 			}
 
-			atomic.StoreInt64(&rf.rejectedVotes, 0)
-
 			// repeat election until I am not a candidate
 			for !rf.killed() {
 				rf.persistentLock.Lock()
@@ -899,13 +901,8 @@ func (rf *Raft) ticker() {
 				DPrintln(Exp2A, Important, "Raft %d starts election at term %d!", rf.me, term)
 
 				timeout := time.Millisecond * time.Duration(rnd(TimeoutMin, TimeoutMax))
-				if atomic.LoadInt64(&rf.rejectedVotes) > 0 {
-					// Other server possesses newer log than me, wait longer
-					timeout = time.Millisecond * time.Duration(rnd(ExtendedTimeoutMin, ExtendedTimeoutMax))
-				}
 
 				atomic.StoreInt64(&rf.receivedVotes, 1)
-				atomic.StoreInt64(&rf.rejectedVotes, 0)
 				rf.broadcast(BroadcastRequestVote, term)
 
 				startTime := time.Now()
