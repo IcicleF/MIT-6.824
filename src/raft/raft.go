@@ -91,6 +91,63 @@ type LogEntry struct {
 	Command interface{}
 }
 
+type LogWithSnapshot struct {
+	snapshot  []byte     // Snapshot content
+	lastIndex int        // Last log entry index
+	lastTerm  int64      // Last log entry term
+	logs      []LogEntry // Logs
+}
+
+const (
+	LogExist = iota
+	LogTermOnly
+	LogCompacted
+	LogNotFound
+)
+
+func (l *LogWithSnapshot) Append(e LogEntry) {
+	l.logs = append(l.logs, e)
+}
+
+func (l *LogWithSnapshot) Len() int {
+	return len(l.logs) + l.lastIndex + 1
+}
+
+func (l *LogWithSnapshot) At(index int) (int, LogEntry) {
+	if index < 0 {
+		return LogExist, LogEntry{Term: -1, Command: nil}
+	}
+	if index < l.lastIndex {
+		return LogCompacted, LogEntry{Term: -1, Command: nil}
+	}
+	if index == l.lastIndex {
+		return LogTermOnly, LogEntry{Term: l.lastTerm, Command: nil}
+	}
+	if index >= l.Len() {
+		return LogNotFound, LogEntry{Term: -1, Command: nil}
+	}
+	return LogExist, l.logs[index-l.lastIndex-1]
+}
+
+func (l *LogWithSnapshot) Compact(index int, snapshot []byte) bool {
+	if index <= l.lastIndex {
+		return false
+	}
+
+	ok, entry := l.At(index)
+	if ok != LogExist {
+		DPrintln(Exp2D, Error, "Try to compact log to %d but fails to get the entry (err %d)!", index, ok)
+		return false
+	}
+
+	l.snapshot = make([]byte, len(snapshot))
+	copy(l.snapshot, snapshot)
+	l.logs = l.logs[index-l.lastIndex:]
+	l.lastIndex = index
+	l.lastTerm = entry.Term
+	return true
+}
+
 // An atomic timestamp
 type Timestamp struct {
 	mut sync.Mutex
@@ -551,12 +608,11 @@ func (rf *Raft) logReplicator(server int) {
 		time.Sleep(time.Millisecond * 10)
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
 			rf.mu.RLock()
-			lastLogIndex := len(rf.logs) - 1
-			rf.mu.RUnlock()
-
 			rf.indexesLock.RLock()
+			lastLogIndex := len(rf.logs) - 1
 			nextIndex := rf.nextIndex[server]
 			rf.indexesLock.RUnlock()
+			rf.mu.RUnlock()
 
 			if lastLogIndex < 0 {
 				// Only replicate if there are logs
