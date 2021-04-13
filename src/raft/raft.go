@@ -94,73 +94,6 @@ type LogEntry struct {
 	Command interface{}
 }
 
-type LogWithSnapshot struct {
-	snapshot  []byte     // Snapshot content
-	lastIndex int        // Last log entry index
-	lastTerm  int64      // Last log entry term
-	logs      []LogEntry // Logs
-}
-
-const (
-	LogExist = iota
-	LogTermOnly
-	LogCompacted
-	LogNotFound
-)
-
-func (l *LogWithSnapshot) Append(e LogEntry) {
-	l.logs = append(l.logs, e)
-}
-
-func (l *LogWithSnapshot) Len() int {
-	return len(l.logs) + l.lastIndex + 1
-}
-
-func (l *LogWithSnapshot) At(index int) (int, LogEntry) {
-	if index < 0 {
-		return LogExist, LogEntry{Term: -1, Command: nil}
-	}
-	if index < l.lastIndex {
-		return LogCompacted, LogEntry{Term: -1, Command: nil}
-	}
-	if index == l.lastIndex {
-		return LogTermOnly, LogEntry{Term: l.lastTerm, Command: nil}
-	}
-	if index >= l.Len() {
-		return LogNotFound, LogEntry{Term: -1, Command: nil}
-	}
-	return LogExist, l.logs[index-l.lastIndex-1]
-}
-
-func (l *LogWithSnapshot) Compact(index int, snapshot []byte) bool {
-	if index <= l.lastIndex {
-		return false
-	}
-
-	ok, entry := l.At(index)
-	if ok != LogExist {
-		DPrintln(Exp2D, Error, "Try to compact log to %d but fails to get the entry (err %d)!", index, ok)
-		return false
-	}
-
-	l.snapshot = make([]byte, len(snapshot))
-	copy(l.snapshot, snapshot)
-	l.logs = l.logs[index-l.lastIndex:]
-	l.lastIndex = index
-	l.lastTerm = entry.Term
-	return true
-}
-
-func (l *LogWithSnapshot) GetSuffix(index int) (bool, []LogEntry) {
-	ok, _ := l.At(index)
-	if ok != LogExist {
-		return false, nil
-	}
-	res := make([]LogEntry, l.Len()-index)
-	copy(res, l.logs[index-l.lastIndex-1:])
-	return true, res
-}
-
 // An atomic timestamp
 type Timestamp struct {
 	mut sync.Mutex
@@ -228,11 +161,12 @@ const (
 
 func (rf *Raft) initFollowerIndexes() {
 	rf.mu.RLock()
-	nextInd := len(rf.logs)
-	rf.mu.RUnlock()
+	defer rf.mu.RUnlock()
 
 	rf.indexesLock.Lock()
 	defer rf.indexesLock.Unlock()
+
+	nextInd := len(rf.logs)
 
 	rf.nextIndex = make([]int64, 0)
 	rf.matchIndex = make([]int64, 0)
@@ -242,7 +176,7 @@ func (rf *Raft) initFollowerIndexes() {
 	}
 }
 
-func (rf *Raft) fastForwardToTerm(term int64, needLock bool) {
+func (rf *Raft) fastForwardToTerm(term int64, needLock bool, needRefreshRPC bool) {
 	if needLock {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -257,7 +191,9 @@ func (rf *Raft) fastForwardToTerm(term int64, needLock bool) {
 	// DPrintln(Exp2C, Warning, "Raft %d setting votedFor = -1", rf.me)
 	rf.persist()
 
-	rf.lastRPC.Set()
+	if needRefreshRPC {
+		rf.lastRPC.Set()
+	}
 }
 
 func (rf *Raft) GetTermAndRole() (int64, int64) {
@@ -421,7 +357,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Transit to new term and follower
 	if args.Term > rf.currentTerm {
-		rf.fastForwardToTerm(args.Term, false)
+		rf.fastForwardToTerm(args.Term, false, false)
 	}
 	reply.Term = rf.currentTerm
 
@@ -487,7 +423,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 type AppendEntriesArgs struct {
 	Term         int64
 	LeaderId     int
-	PrevLogIndex int64
+	PrevLogIndex int
 	PrevLogTerm  int64
 	Entries      []LogEntry
 	LeaderCommit int64
@@ -509,7 +445,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	role := atomic.LoadInt64(&rf.role)
 	logLen := len(rf.logs)
-	if args.PrevLogIndex >= 0 && args.PrevLogIndex < int64(logLen) {
+	if args.PrevLogIndex >= 0 && args.PrevLogIndex < logLen {
 		prevLogTerm = rf.logs[args.PrevLogIndex].Term
 	}
 
@@ -529,7 +465,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	atomic.StoreInt64(&rf.role, RoleFollower)
 	if args.Term > reply.Term {
-		rf.fastForwardToTerm(args.Term, false)
+		rf.fastForwardToTerm(args.Term, false, true)
 		role = RoleFollower
 	}
 	reply.Term = rf.currentTerm
@@ -565,11 +501,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 4. Append any new entries not already in the log
 	lastEntry := len(rf.logs) - 1
 	if len(args.Entries) > 0 {
-		DPrintln(Exp2C, Info, "Raft %d: before AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-		DPrintln(Exp2C, Info, "Raft %d: after AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
-		lastEntry = len(rf.logs) - 1
-		rf.persist() // logs changed
+		DPrintln(Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %v.",
+			rf.me, args.LeaderId, args.PrevLogIndex, rf.logs)
+
+		firstUnmatch := -1
+		for i := 0; i < len(args.Entries); i++ {
+			index := args.PrevLogIndex + 1 + i
+			if index > lastEntry || rf.logs[index].Term != args.Entries[i].Term {
+				firstUnmatch = i
+				break
+			}
+		}
+
+		if firstUnmatch >= 0 {
+			rf.logs = append(rf.logs[:args.PrevLogIndex+1+firstUnmatch], args.Entries[firstUnmatch:]...)
+			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
+			lastEntry = len(rf.logs) - 1
+			rf.persist() // logs changed
+		} else {
+			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, unchanged.", rf.me, args.LeaderId)
+		}
 	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -615,19 +566,26 @@ func (rf *Raft) logApplier() {
 }
 
 func (rf *Raft) logReplicator(server int) {
-	const continuousRejectThreshold = 10
+	const continuousRejectThreshold = 3
 
 	for !rf.killed() {
 		time.Sleep(time.Millisecond * 10)
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
+			unprepared := false
+			var nextIndex int64 = -1
+
 			rf.mu.RLock()
 			rf.indexesLock.RLock()
 			lastLogIndex := len(rf.logs) - 1
-			nextIndex := rf.nextIndex[server]
+			if len(rf.nextIndex) == len(rf.peers) {
+				nextIndex = rf.nextIndex[server]
+			} else {
+				unprepared = true
+			}
 			rf.indexesLock.RUnlock()
 			rf.mu.RUnlock()
 
-			if lastLogIndex < 0 {
+			if lastLogIndex < 0 || unprepared {
 				// Only replicate if there are logs
 				continue
 			}
@@ -648,7 +606,7 @@ func (rf *Raft) logReplicator(server int) {
 					break
 				}
 
-				ok, logLen, replUntil := rf.doSendAppendEntries(server, term, nextIndex)
+				ok, logLen, replUntil := rf.doSendAppendEntries(server, term, int(nextIndex))
 				if ok == RPCRetracted {
 					break
 				}
@@ -722,7 +680,7 @@ func (rf *Raft) logCommitter() {
 				majorityMatched = len(rf.logs) - 1
 			}
 
-			// N > commitIndex ...
+			// N > commitIndex ...1
 			ok := majorityMatched > int(atomic.LoadInt64(&rf.commitIndex))
 
 			// ... and log[N].term == currentTerm
@@ -847,7 +805,7 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > args.Term {
-		rf.fastForwardToTerm(reply.Term, true)
+		rf.fastForwardToTerm(reply.Term, true, true)
 		return RPCRetracted
 	}
 
@@ -866,7 +824,7 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 }
 
 // Returns (RPCStatus, RemoteLogLen, LocalReplicatedLogEnd)
-func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, int, int) {
+func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int, int) {
 	DPrintln(Exp2A, Log, "Raft %d: doSendAppendEntries to %d", rf.me, server)
 
 	args := AppendEntriesArgs{}
@@ -877,7 +835,7 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, in
 	args.LeaderId = rf.me
 	logLen := len(rf.logs)
 	if head < 0 {
-		head = int64(logLen)
+		head = logLen
 	}
 
 	args.PrevLogIndex = head - 1
@@ -901,7 +859,7 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int64) (int, in
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > args.Term {
 		DPrintln(Exp2B, Warning, "Raft %d fast-forwards to term %d and convert to follower.", rf.me, reply.Term)
-		rf.fastForwardToTerm(reply.Term, true)
+		rf.fastForwardToTerm(reply.Term, true, true)
 		res = RPCRetracted
 	} else if !reply.Ok {
 		// DPrintln(Exp2A, Warning,
@@ -966,9 +924,9 @@ func (rf *Raft) ticker() {
 						// (a) I win the election
 						DPrintln(Exp2A, Important, "Raft %d thinks it has won!", rf.me)
 						// rf.tracer.Append(fmt.Sprintf("Win election in term %d.", term))
-						atomic.StoreInt64(&rf.role, RoleLeader)
-						atomic.StoreInt64(&rf.LeaderId, int64(rf.me))
 						rf.initFollowerIndexes()
+						atomic.StoreInt64(&rf.LeaderId, int64(rf.me))
+						atomic.StoreInt64(&rf.role, RoleLeader)
 						rf.broadcast(BroadcastHeartbeat, term)
 					}
 					time.Sleep(time.Millisecond * 10)
