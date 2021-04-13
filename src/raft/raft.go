@@ -86,6 +86,9 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// Logger (must be used inside a lock)
+// ======================================================================
+
 type LogEntry struct {
 	Term    int64
 	Command interface{}
@@ -146,6 +149,16 @@ func (l *LogWithSnapshot) Compact(index int, snapshot []byte) bool {
 	l.lastIndex = index
 	l.lastTerm = entry.Term
 	return true
+}
+
+func (l *LogWithSnapshot) GetSuffix(index int) (bool, []LogEntry) {
+	ok, _ := l.At(index)
+	if ok != LogExist {
+		return false, nil
+	}
+	res := make([]LogEntry, l.Len()-index)
+	copy(res, l.logs[index-l.lastIndex-1:])
+	return true, res
 }
 
 // An atomic timestamp
