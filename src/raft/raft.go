@@ -94,6 +94,85 @@ type LogEntry struct {
 	Command interface{}
 }
 
+type LogWithSnapshot struct {
+	Snapshot  []byte     // Snapshot content
+	LastIndex int        // Last log entry index
+	LastTerm  int64      // Last log entry term
+	Logs      []LogEntry // Logs
+}
+
+const (
+	LogExist = iota
+	LogTermOnly
+	LogCompacted
+	LogNotFound
+)
+
+func (l *LogWithSnapshot) Append(e LogEntry) {
+	l.Logs = append(l.Logs, e)
+}
+
+func (l *LogWithSnapshot) AppendFrom(index int, e []LogEntry) {
+	l.Logs = append(l.Logs[:index-l.LastIndex-1], e...)
+}
+
+func (l *LogWithSnapshot) Len() int {
+	return len(l.Logs) + l.LastIndex + 1
+}
+
+func (l *LogWithSnapshot) At(index int) (int, LogEntry) {
+	if index < 0 {
+		return LogExist, LogEntry{Term: -1, Command: nil}
+	}
+	if index < l.LastIndex {
+		return LogCompacted, LogEntry{Term: -1, Command: nil}
+	}
+	if index == l.LastIndex {
+		return LogTermOnly, LogEntry{Term: l.LastTerm, Command: nil}
+	}
+	if index >= l.Len() {
+		return LogNotFound, LogEntry{Term: -1, Command: nil}
+	}
+	return LogExist, l.Logs[index-l.LastIndex-1]
+}
+
+func (l *LogWithSnapshot) Compact(index int, snapshot []byte) bool {
+	if index <= l.LastIndex {
+		return false
+	}
+
+	ok, entry := l.At(index)
+	if ok != LogExist {
+		DPrintln(Exp2D, Error, "Try to compact log to %d but fails to get the entry (err %d)!", index, ok)
+		return false
+	}
+
+	l.Snapshot = make([]byte, len(snapshot))
+	copy(l.Snapshot, snapshot)
+	l.Logs = l.Logs[index-l.LastIndex:]
+	l.LastIndex = index
+	l.LastTerm = entry.Term
+	return true
+}
+
+func (l *LogWithSnapshot) GetLast() (int, int64) {
+	if len(l.Logs) > 0 {
+		i := len(l.Logs) - 1
+		return l.Len() - 1, l.Logs[i].Term
+	}
+	return l.LastIndex, l.LastTerm
+}
+
+func (l *LogWithSnapshot) GetSuffix(index int) (bool, []LogEntry) {
+	ok, _ := l.At(index)
+	if ok != LogExist {
+		return false, nil
+	}
+	res := make([]LogEntry, l.Len()-index)
+	copy(res, l.Logs[index-l.LastIndex-1:])
+	return true, res
+}
+
 // An atomic timestamp
 type Timestamp struct {
 	mut sync.Mutex
@@ -131,9 +210,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int64      // last term server has seen
-	votedFor    int        // candidate ID that received vote in current term
-	logs        []LogEntry // log entry array
+	currentTerm int64           // last term server has seen
+	votedFor    int             // candidate ID that received vote in current term
+	logs        LogWithSnapshot // log entry array
 
 	commitIndex int64 // index of highest log entry known to be commited
 	lastApplied int64 // index of highest log entry applied to state machine
@@ -166,7 +245,7 @@ func (rf *Raft) initFollowerIndexes() {
 	rf.indexesLock.Lock()
 	defer rf.indexesLock.Unlock()
 
-	nextInd := len(rf.logs)
+	nextInd := rf.logs.Len()
 
 	rf.nextIndex = make([]int64, 0)
 	rf.matchIndex = make([]int64, 0)
@@ -221,11 +300,8 @@ func (rf *Raft) PrintState() {
 	rf.mu.RLock()
 	currentTerm = rf.currentTerm
 	role = rf.role
-	logLen = len(rf.logs)
-	lastLogTerm = -1
-	if logLen > 0 {
-		lastLogTerm = rf.logs[logLen-1].Term
-	}
+	logLen = rf.logs.Len()
+	_, lastLogTerm = rf.logs.GetLast()
 	rf.mu.RUnlock()
 
 	roleStr := ""
@@ -271,7 +347,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = 0
 		rf.votedFor = -1
 		// DPrintln(Exp2C, Warning, "Raft %d setting votedFor = -1", rf.me)
-		rf.logs = make([]LogEntry, 0)
+		rf.logs = LogWithSnapshot{Snapshot: nil, LastIndex: -1, LastTerm: -1, Logs: make([]LogEntry, 0)}
 		return
 	}
 
@@ -340,11 +416,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	DPrintln(Exp2A, Info, "Raft %d received RequestVote from %d with term %d.", rf.me, args.CandidateId, args.Term)
 
-	var localLastLogTerm int64 = -1
-	localLastLogIndex := len(rf.logs) - 1
-	if localLastLogIndex >= 0 {
-		localLastLogTerm = rf.logs[localLastLogIndex].Term
-	}
+	localLastLogIndex, localLastLogTerm := rf.logs.GetLast()
 
 	// 1. Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -444,9 +516,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	var prevLogTerm int64 = -1
 
 	role := atomic.LoadInt64(&rf.role)
-	logLen := len(rf.logs)
+	logLen := rf.logs.Len()
 	if args.PrevLogIndex >= 0 && args.PrevLogIndex < logLen {
-		prevLogTerm = rf.logs[args.PrevLogIndex].Term
+		ok, entry := rf.logs.At(args.PrevLogIndex)
+		if ok == LogNotFound {
+			DPrintln(Exp2D, Error, "Raft %d cannot find log[%d]!", rf.me, args.PrevLogIndex)
+			return
+		}
+		if ok == LogCompacted {
+			DPrintln(Exp2D, Warning, "Raft %d detects previous log entry [%d] has been compacted.",
+				rf.me, args.PrevLogIndex)
+		}
+		prevLogTerm = entry.Term
 	}
 
 	// 1. Reply false if term < currentTerm
@@ -499,7 +580,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 3. If an existing entry conflicts with a new one, delete the existing entry and all that follows it
 	// 4. Append any new entries not already in the log
-	lastEntry := len(rf.logs) - 1
+	lastEntry := rf.logs.Len() - 1
 	if len(args.Entries) > 0 {
 		DPrintln(Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %v.",
 			rf.me, args.LeaderId, args.PrevLogIndex, rf.logs)
@@ -507,16 +588,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		firstUnmatch := -1
 		for i := 0; i < len(args.Entries); i++ {
 			index := args.PrevLogIndex + 1 + i
-			if index > lastEntry || rf.logs[index].Term != args.Entries[i].Term {
+			_, entry := rf.logs.At(index)
+			if index > lastEntry || entry.Term != args.Entries[i].Term {
 				firstUnmatch = i
 				break
 			}
 		}
 
 		if firstUnmatch >= 0 {
-			rf.logs = append(rf.logs[:args.PrevLogIndex+1+firstUnmatch], args.Entries[firstUnmatch:]...)
+			// rf.logs = append(rf.logs[:args.PrevLogIndex+1+firstUnmatch], args.Entries[firstUnmatch:]...)
+			rf.logs.AppendFrom(args.PrevLogIndex+1+firstUnmatch, args.Entries[firstUnmatch:])
 			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
-			lastEntry = len(rf.logs) - 1
+			lastEntry = rf.logs.Len() - 1
+
 			rf.persist() // logs changed
 		} else {
 			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, unchanged.", rf.me, args.LeaderId)
@@ -550,8 +634,13 @@ func (rf *Raft) logApplier() {
 		applyIndex := rf.lastApplied
 
 		rf.mu.RLock()
-		entry := rf.logs[applyIndex]
+		ok, entry := rf.logs.At(int(applyIndex))
 		rf.mu.RUnlock()
+
+		if ok != LogExist {
+			DPrintln(Exp2D, Warning, "Raft %d cannot apply log[%d] since it does not exist.", rf.me, applyIndex)
+			continue
+		}
 
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -571,21 +660,14 @@ func (rf *Raft) logReplicator(server int) {
 	for !rf.killed() {
 		time.Sleep(time.Millisecond * 10)
 		if atomic.LoadInt64(&rf.role) == RoleLeader {
-			unprepared := false
-			var nextIndex int64 = -1
-
 			rf.mu.RLock()
 			rf.indexesLock.RLock()
-			lastLogIndex := len(rf.logs) - 1
-			if len(rf.nextIndex) == len(rf.peers) {
-				nextIndex = rf.nextIndex[server]
-			} else {
-				unprepared = true
-			}
+			lastLogIndex := rf.logs.Len() - 1
+			nextIndex := rf.nextIndex[server]
 			rf.indexesLock.RUnlock()
 			rf.mu.RUnlock()
 
-			if lastLogIndex < 0 || unprepared {
+			if lastLogIndex < 0 {
 				// Only replicate if there are logs
 				continue
 			}
@@ -666,7 +748,7 @@ func (rf *Raft) logCommitter() {
 			rf.indexesLock.RLock()
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
-					matchIndex[i] = len(rf.logs) - 1
+					matchIndex[i] = rf.logs.Len() - 1
 					continue
 				}
 				matchIndex[i] = int(rf.matchIndex[i])
@@ -676,15 +758,16 @@ func (rf *Raft) logCommitter() {
 			// Find the matchIndex majority
 			sort.Ints(matchIndex)
 			majorityMatched := matchIndex[len(rf.peers)-majority(len(rf.peers))]
-			if majorityMatched >= len(rf.logs) {
-				majorityMatched = len(rf.logs) - 1
+			if majorityMatched >= rf.logs.Len() {
+				majorityMatched = rf.logs.Len() - 1
 			}
 
 			// N > commitIndex ...1
 			ok := majorityMatched > int(atomic.LoadInt64(&rf.commitIndex))
 
 			// ... and log[N].term == currentTerm
-			ok = ok && (rf.logs[majorityMatched].Term == rf.currentTerm)
+			eok, entry := rf.logs.At(majorityMatched)
+			ok = ok && (eok != LogNotFound) && (eok != LogCompacted) && (entry.Term == rf.currentTerm)
 			rf.mu.RUnlock()
 
 			// Set commitIndex = N
@@ -729,8 +812,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Starts agreement
 	term := rf.currentTerm
-	index := len(rf.logs)
-	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+	index := rf.logs.Len()
+	// rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+	rf.logs.Append(LogEntry{Term: term, Command: command})
 	rf.persist()
 
 	DPrintln(Exp2B, Log, "Raft %d starts agreement on term %d, index %d.", rf.me, term, index)
@@ -790,12 +874,9 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 	args.CandidateId = rf.me
 
 	rf.mu.RLock()
-	args.LastLogIndex = int64(len(rf.logs) - 1)
-	if args.LastLogIndex < 0 {
-		args.LastLogTerm = -1
-	} else {
-		args.LastLogTerm = rf.logs[args.LastLogIndex].Term
-	}
+	lastLogIndex, lastLogTerm := rf.logs.GetLast()
+	args.LastLogIndex = int64(lastLogIndex)
+	args.LastLogTerm = lastLogTerm
 	rf.mu.RUnlock()
 
 	ok := rf.sendRequestVote(server, &args, &reply)
@@ -836,7 +917,7 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int,
 	rf.mu.RLock()
 	args.Term = term
 	args.LeaderId = rf.me
-	logLen := len(rf.logs)
+	logLen := rf.logs.Len()
 	if head < 0 {
 		head = logLen
 	}
@@ -845,10 +926,11 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int,
 	if head == 0 {
 		args.PrevLogTerm = -1
 	} else {
-		args.PrevLogTerm = rf.logs[head-1].Term
+		_, entry := rf.logs.At(head - 1)
+		args.PrevLogTerm = entry.Term
 	}
-	args.Entries = make([]LogEntry, logLen-int(head))
-	copy(args.Entries, rf.logs[head:logLen])
+	_, suffix := rf.logs.GetSuffix(head)
+	args.Entries = suffix
 	rf.mu.RUnlock()
 
 	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
