@@ -33,7 +33,7 @@ import (
 	"6.824/labrpc"
 )
 
-const TimeoutMin = 300
+const TimeoutMin = 250
 const TimeoutMax = 600
 const TimeoutHeartbeat = 100
 
@@ -809,8 +809,11 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 		return RPCRetracted
 	}
 
-	// Need to verify that I am still a candidate
-	if atomic.LoadInt64(&rf.role) != RoleCandidate {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+
+	// Need to verify that I am still a candidate (and also in the same term)
+	if atomic.LoadInt64(&rf.role) != RoleCandidate || rf.currentTerm != args.Term {
 		return RPCRetracted
 	}
 
