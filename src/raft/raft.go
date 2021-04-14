@@ -87,7 +87,7 @@ type ApplyMsg struct {
 }
 
 // Logger (must be used inside a lock)
-// ======================================================================
+// =========================================================================================================
 
 type LogEntry struct {
 	Term    int64
@@ -149,9 +149,9 @@ func (l *LogWithSnapshot) Compact(index int, snapshot []byte) bool {
 
 	l.Snapshot = make([]byte, len(snapshot))
 	copy(l.Snapshot, snapshot)
-	l.Logs = l.Logs[index-l.LastIndex:]
 	l.LastIndex = index
 	l.LastTerm = entry.Term
+	l.Logs = l.Logs[index-l.LastIndex:]
 	return true
 }
 
@@ -173,7 +173,16 @@ func (l *LogWithSnapshot) GetSuffix(index int) (bool, []LogEntry) {
 	return true, res
 }
 
-// An atomic timestamp
+func (l *LogWithSnapshot) Reset(index int, term int64, snapshot []byte) {
+	l.Snapshot = snapshot
+	l.Logs = make([]LogEntry, 0)
+	l.LastIndex = index
+	l.LastTerm = term
+}
+
+// Atomic Timestamper
+// =========================================================================================================
+
 type Timestamp struct {
 	mut sync.Mutex
 	t   time.Time
@@ -196,6 +205,9 @@ func (at *Timestamp) Since() time.Duration {
 	defer at.mut.Unlock()
 	return time.Since(at.t)
 }
+
+// Main Raft
+// =========================================================================================================
 
 //
 // A Go object implementing a single Raft peer.
@@ -230,6 +242,9 @@ type Raft struct {
 	applyCh   chan ApplyMsg // apply messages
 	applyLock sync.Mutex    // apply lock
 	applyCond sync.Cond     // apply condvar
+
+	snapshotLock sync.Mutex // snapshot lock
+	snapshotCond sync.Cond  // snapshot condvar, to wait in an AppendEntries for snapshot installing
 }
 
 const (
@@ -238,6 +253,7 @@ const (
 	RoleCandidate
 )
 
+// Initialize leader indexes (for tracing follower logs)
 func (rf *Raft) initFollowerIndexes() {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
@@ -255,6 +271,7 @@ func (rf *Raft) initFollowerIndexes() {
 	}
 }
 
+// Fast-forward to a higher term and revert to follower
 func (rf *Raft) fastForwardToTerm(term int64, needLock bool, needRefreshRPC bool) {
 	if needLock {
 		rf.mu.Lock()
@@ -371,7 +388,16 @@ func (rf *Raft) readPersist(data []byte) {
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	// Your code here (2D).
+	// rf.mu.RLock()
+	// defer rf.mu.RUnlock()
 
+	rf.snapshotLock.Lock()
+	defer rf.snapshotLock.Unlock()
+
+	// Signals the condvar to continue AppendEntries
+	rf.snapshotCond.Signal()
+
+	// CondInstallSnapshot always returns true
 	return true
 }
 
@@ -381,9 +407,15 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.logs.Compact(index, snapshot)
+	rf.persist()
 }
 
+// RequestVote
+// =========================================================================================================
 //
 // RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -492,13 +524,18 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 // AppendEntries
+// =========================================================================================================
+
 type AppendEntriesArgs struct {
-	Term         int64
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int64
-	Entries      []LogEntry
-	LeaderCommit int64
+	Term              int64
+	LeaderId          int
+	PrevLogIndex      int
+	PrevLogTerm       int64
+	Snapshot          []byte
+	SnapshotLastIndex int
+	SnapshotLastTerm  int64
+	Entries           []LogEntry
+	LeaderCommit      int64
 }
 
 type AppendEntriesReply struct {
@@ -615,10 +652,92 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// DPrintln(Exp2, Info, "Raft %d sending AppendEntries to %d", rf.me, server)
+	// DPrintln(Exp2, Info, "Raft %d sending AppendEntries to %d.", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+
+// InstallSnapshot
+// =========================================================================================================
+
+type InstallSnapshotArgs struct {
+	Term              int64
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int64
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int64
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintln(Exp2D, Info, "Raft %d received InstallSnapshot from %d.", rf.me, args.LeaderId)
+
+	if args.Term < rf.currentTerm {
+		DPrintln(Exp2D, Warning, "Raft %d rejected InstallSnapshot from %d because of smaller term.",
+			rf.me, args.LeaderId)
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	role := atomic.LoadInt64(&rf.role)
+
+	// Convert to follower
+	if role != RoleFollower {
+		DPrintln(Exp2D, Warning, "Raft %d is not follower when receiving InstallSnapshot from %d.",
+			rf.me, args.LeaderId)
+	}
+	atomic.StoreInt64(&rf.role, RoleFollower)
+	if args.Term > reply.Term {
+		rf.fastForwardToTerm(args.Term, false, true)
+		role = RoleFollower
+	}
+	reply.Term = rf.currentTerm
+
+	// Valid request from leader, update related variables
+	atomic.StoreInt64(&rf.LeaderId, int64(args.LeaderId))
+	rf.lastRPC.Set()
+
+	ok, entry := rf.logs.At(args.LastIncludedIndex)
+	if ok == LogNotFound {
+		DPrintln(Exp2D, Error, "Raft %d cannot find log entry[%d] specified by InstallSnapshot.",
+			rf.me, args.LastIncludedIndex)
+	}
+
+	// 6. If existing log entry has same index and term as snapshot's last included entry, retain log
+	//    entries following it and reply
+	if args.Term == entry.Term {
+		rf.logs.Compact(args.LastIncludedIndex, args.Data)
+		return
+	}
+
+	rf.logs.Reset(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  int(args.LastIncludedTerm),
+	}
+	rf.applyCh <- applyMsg
+
+	DPrintln(Exp2B, Important, "Raft %d successfully installed snapshot to index %d, term %d.",
+		rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// DPrintln(Exp2D, Info, "Raft %d sending InstallSnapshot to %d.", rf.me, server)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+// Raft log replication
+// =========================================================================================================
 
 func (rf *Raft) logApplier() {
 	rf.applyLock.Lock()
@@ -655,7 +774,7 @@ func (rf *Raft) logApplier() {
 }
 
 func (rf *Raft) logReplicator(server int) {
-	const continuousRejectThreshold = 3
+	const continuousRejectThreshold = 5
 
 	for !rf.killed() {
 		time.Sleep(time.Millisecond * 10)
@@ -732,7 +851,7 @@ func (rf *Raft) logReplicator(server int) {
 					continue
 				}
 				DPrintln(Exp2ABC, Warning, "Raft %d losts its AppendEntries to %d!", rf.me, server)
-				time.Sleep(time.Millisecond * 10)
+				time.Sleep(time.Millisecond * 1)
 			}
 		}
 	}
@@ -940,11 +1059,18 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int,
 		return RPCLost, 0, -1
 	}
 
+	rf.mu.RLock()
+	currentTerm := rf.currentTerm
+	rf.mu.RUnlock()
+
 	res := RPCOk
 	// If RPC response contains term > currentTerm, set currentTerm = term, convert to follower
 	if reply.Term > args.Term {
 		DPrintln(Exp2B, Warning, "Raft %d fast-forwards to term %d and convert to follower.", rf.me, reply.Term)
 		rf.fastForwardToTerm(reply.Term, true, true)
+		res = RPCRetracted
+	} else if currentTerm > args.Term {
+		// Out-dated RPC, drop
 		res = RPCRetracted
 	} else if !reply.Ok {
 		// DPrintln(Exp2A, Warning,
