@@ -1,0 +1,78 @@
+// InstallSnapshot
+// =========================================================================================================
+
+type InstallSnapshotArgs struct {
+	Term              int64
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int64
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int64
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintln(Exp2D, Info, "Raft %d received InstallSnapshot from %d.", rf.me, args.LeaderId)
+
+	if args.Term < rf.currentTerm {
+		DPrintln(Exp2D, Warning, "Raft %d rejected InstallSnapshot from %d because of smaller term.",
+			rf.me, args.LeaderId)
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	role := atomic.LoadInt64(&rf.role)
+
+	// Convert to follower
+	if role != RoleFollower {
+		DPrintln(Exp2D, Warning, "Raft %d is not follower when receiving InstallSnapshot from %d.",
+			rf.me, args.LeaderId)
+	}
+	atomic.StoreInt64(&rf.role, RoleFollower)
+	if args.Term > reply.Term {
+		rf.fastForwardToTerm(args.Term, false, true)
+		role = RoleFollower
+	}
+	reply.Term = rf.currentTerm
+
+	// Valid request from leader, update related variables
+	atomic.StoreInt64(&rf.LeaderId, int64(args.LeaderId))
+	rf.lastRPC.Set()
+
+	ok, entry := rf.logs.At(args.LastIncludedIndex)
+	if ok == LogNotFound {
+		DPrintln(Exp2D, Error, "Raft %d cannot find log entry[%d] specified by InstallSnapshot.",
+			rf.me, args.LastIncludedIndex)
+	}
+
+	// 6. If existing log entry has same index and term as snapshot's last included entry, retain log
+	//    entries following it and reply
+	if args.Term == entry.Term {
+		rf.logs.Compact(args.LastIncludedIndex, args.Data)
+		return
+	}
+
+	rf.logs.Reset(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  int(args.LastIncludedTerm),
+	}
+	rf.applyCh <- applyMsg
+
+	DPrintln(Exp2B, Important, "Raft %d successfully installed snapshot to index %d, term %d.",
+		rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// DPrintln(Exp2D, Info, "Raft %d sending InstallSnapshot to %d.", rf.me, server)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}

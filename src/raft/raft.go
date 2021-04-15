@@ -149,9 +149,9 @@ func (l *LogWithSnapshot) Compact(index int, snapshot []byte) bool {
 
 	l.Snapshot = make([]byte, len(snapshot))
 	copy(l.Snapshot, snapshot)
+	l.Logs = l.Logs[index-l.LastIndex:]
 	l.LastIndex = index
 	l.LastTerm = entry.Term
-	l.Logs = l.Logs[index-l.LastIndex:]
 	return true
 }
 
@@ -163,21 +163,36 @@ func (l *LogWithSnapshot) GetLast() (int, int64) {
 	return l.LastIndex, l.LastTerm
 }
 
-func (l *LogWithSnapshot) GetSuffix(index int) (bool, []LogEntry) {
+func (l *LogWithSnapshot) GetSuffix(index int) []LogEntry {
 	ok, _ := l.At(index)
 	if ok != LogExist {
-		return false, nil
+		return make([]LogEntry, 0)
 	}
 	res := make([]LogEntry, l.Len()-index)
 	copy(res, l.Logs[index-l.LastIndex-1:])
-	return true, res
+	return res
 }
 
-func (l *LogWithSnapshot) Reset(index int, term int64, snapshot []byte) {
+func (l *LogWithSnapshot) FollowSnapshot(snapshot []byte, index int, term int64) (bool, bool) {
+	if l.LastIndex >= index {
+		// My log is no shorter than yours
+		return false, false
+	}
+
+	ok, entry := l.At(index)
+	if ok == LogExist && entry.Term == term {
+		// If I have the last entry of the leader snapshot, I should not discard logs
+		// Instead, I only compact my log to the same length of the leader's
+		l.Compact(index, snapshot)
+		return true, false
+	}
+
+	// Otherwise, discard my log and follow the leaders
 	l.Snapshot = snapshot
-	l.Logs = make([]LogEntry, 0)
 	l.LastIndex = index
 	l.LastTerm = term
+	l.Logs = make([]LogEntry, 0)
+	return true, true
 }
 
 // Atomic Timestamper
@@ -243,8 +258,9 @@ type Raft struct {
 	applyLock sync.Mutex    // apply lock
 	applyCond sync.Cond     // apply condvar
 
-	snapshotLock sync.Mutex // snapshot lock
-	snapshotCond sync.Cond  // snapshot condvar, to wait in an AppendEntries for snapshot installing
+	snapshotLock      sync.Mutex // snapshot lock
+	snapshotCond      sync.Cond  // snapshot condvar, to wait in an AppendEntries for snapshot installing
+	snapshotInstalled bool       // use with condvar to indicate a successful install
 }
 
 const (
@@ -378,6 +394,11 @@ func (rf *Raft) readPersist(data []byte) {
 		DPrintln(Exp2C, Error, "Raft %d cannot decode persistent data!")
 	}
 
+	// Recover from snapshot if it exists
+	if rf.logs.LastIndex >= 0 {
+		rf.syncInstallSnapshot()
+	}
+
 	DPrintln(Exp2C, Info, "Raft %d successfully decoded {term = %d, vote = %d, log = %v}.",
 		rf.me, rf.currentTerm, rf.votedFor, rf.logs)
 }
@@ -395,6 +416,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	defer rf.snapshotLock.Unlock()
 
 	// Signals the condvar to continue AppendEntries
+	rf.snapshotInstalled = true
 	rf.snapshotCond.Signal()
 
 	// CondInstallSnapshot always returns true
@@ -410,8 +432,31 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.logs.Compact(index, snapshot)
+	// Need index-1 because we start log from index 0
+	rf.logs.Compact(index-1, snapshot)
+	DPrintln(Exp2D, Info, "Raft %d received compaction to index %d -> %+v.", rf.me, index, rf.logs)
+
 	rf.persist()
+}
+
+// Must be used when rf.mu is locked
+func (rf *Raft) syncInstallSnapshot() {
+	rf.snapshotLock.Lock()
+	defer rf.snapshotLock.Unlock()
+
+	rf.snapshotInstalled = false
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.logs.Snapshot,
+		SnapshotIndex: rf.logs.LastIndex + 1,
+		SnapshotTerm:  int(rf.logs.LastTerm),
+	}
+	rf.applyCh <- applyMsg
+
+	for !rf.snapshotInstalled {
+		rf.snapshotCond.Wait()
+	}
 }
 
 // RequestVote
@@ -527,15 +572,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // =========================================================================================================
 
 type AppendEntriesArgs struct {
-	Term              int64
-	LeaderId          int
-	PrevLogIndex      int
-	PrevLogTerm       int64
+	Term         int64
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int64
+	Entries      []LogEntry
+	LeaderCommit int64
+
+	SnapshotValid     bool
 	Snapshot          []byte
 	SnapshotLastIndex int
 	SnapshotLastTerm  int64
-	Entries           []LogEntry
-	LeaderCommit      int64
 }
 
 type AppendEntriesReply struct {
@@ -550,22 +597,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	DPrintln(Exp2AB, Log, "Raft %d received AppendEntries from %d.", rf.me, args.LeaderId)
 
-	var prevLogTerm int64 = -1
-
 	role := atomic.LoadInt64(&rf.role)
-	logLen := rf.logs.Len()
-	if args.PrevLogIndex >= 0 && args.PrevLogIndex < logLen {
-		ok, entry := rf.logs.At(args.PrevLogIndex)
-		if ok == LogNotFound {
-			DPrintln(Exp2D, Error, "Raft %d cannot find log[%d]!", rf.me, args.PrevLogIndex)
-			return
-		}
-		if ok == LogCompacted {
-			DPrintln(Exp2D, Warning, "Raft %d detects previous log entry [%d] has been compacted.",
-				rf.me, args.PrevLogIndex)
-		}
-		prevLogTerm = entry.Term
-	}
 
 	// 1. Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -595,13 +627,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 	phase2Flag := true
 
-	if logLen <= int(args.PrevLogIndex) {
-		phase2Flag = false
-	} else if args.PrevLogIndex >= 0 {
-		phase2Flag = prevLogTerm == args.PrevLogTerm
+	logLen := rf.logs.Len()
+	reply.MyLogLen = logLen
+
+	// Check prevLog only if RPC does not contain a snapshot
+	if !args.SnapshotValid {
+		ok, entry := rf.logs.At(args.PrevLogIndex)
+		if ok == LogNotFound {
+			phase2Flag = false
+		} else if ok != LogCompacted {
+			// If log is compacted, then prevLog automatically matches
+			term := entry.Term
+			if term != args.PrevLogTerm {
+				phase2Flag = false
+			}
+		}
 	}
 
-	reply.MyLogLen = logLen
 	if !phase2Flag {
 		if len(args.Entries) != 0 {
 			DPrintln(Exp2B, Warning,
@@ -618,27 +660,57 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3. If an existing entry conflicts with a new one, delete the existing entry and all that follows it
 	// 4. Append any new entries not already in the log
 	lastEntry := rf.logs.Len() - 1
-	if len(args.Entries) > 0 {
-		DPrintln(Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %v.",
+	if len(args.Entries) > 0 || args.SnapshotValid {
+		DPrintln(Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %+v.",
 			rf.me, args.LeaderId, args.PrevLogIndex, rf.logs)
 
+		localLogCheckOffset := 0
+		leaderLogCheckOffset := 0
+
+		logChanged := false
+		if args.SnapshotValid {
+			// Snapshot valid, must be a whole log prefix
+			var needInstall bool = false
+			logChanged, needInstall = rf.logs.FollowSnapshot(args.Snapshot, args.SnapshotLastIndex, args.SnapshotLastTerm)
+			leaderLogCheckOffset = rf.logs.LastIndex - args.SnapshotLastIndex
+			if needInstall {
+				DPrintln(Exp2D, Info, "Raft %d received newer snapshot from %d and decided to install snapshot %v.",
+					rf.me, args.LeaderId, args.Snapshot)
+				rf.syncInstallSnapshot()
+			}
+		} else {
+			if args.PrevLogIndex+1 <= rf.logs.LastIndex {
+				// [  my snapshot  ][     my log     ]
+				//              ^[  server log  ]
+				leaderLogCheckOffset = rf.logs.LastIndex - args.PrevLogIndex
+			} else {
+				// [  my snapshot  ][     my log     ]
+				//                    ^[  server log  ]
+				localLogCheckOffset = args.PrevLogIndex - rf.logs.LastIndex
+			}
+		}
+
 		firstUnmatch := -1
-		for i := 0; i < len(args.Entries); i++ {
-			index := args.PrevLogIndex + 1 + i
-			_, entry := rf.logs.At(index)
-			if index > lastEntry || entry.Term != args.Entries[i].Term {
+		for i := 0; i+leaderLogCheckOffset < len(args.Entries); i++ {
+			ok, entry := rf.logs.At(i + localLogCheckOffset)
+			if ok != LogExist || entry.Term != args.Entries[i+leaderLogCheckOffset].Term {
 				firstUnmatch = i
 				break
 			}
 		}
-
 		if firstUnmatch >= 0 {
-			// rf.logs = append(rf.logs[:args.PrevLogIndex+1+firstUnmatch], args.Entries[firstUnmatch:]...)
-			rf.logs.AppendFrom(args.PrevLogIndex+1+firstUnmatch, args.Entries[firstUnmatch:])
-			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
-			lastEntry = rf.logs.Len() - 1
+			logChanged = true
+			rf.logs.AppendFrom(
+				firstUnmatch+localLogCheckOffset+rf.logs.LastIndex+1,
+				args.Entries[firstUnmatch+leaderLogCheckOffset:],
+			)
+		}
 
-			rf.persist() // logs changed
+		if logChanged {
+			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, log = %+v.", rf.me, args.LeaderId, rf.logs)
+			rf.persist()
+
+			lastEntry = rf.logs.Len() - 1
 		} else {
 			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, unchanged.", rf.me, args.LeaderId)
 		}
@@ -654,85 +726,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	// DPrintln(Exp2, Info, "Raft %d sending AppendEntries to %d.", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-// InstallSnapshot
-// =========================================================================================================
-
-type InstallSnapshotArgs struct {
-	Term              int64
-	LeaderId          int
-	LastIncludedIndex int
-	LastIncludedTerm  int64
-	Data              []byte
-}
-
-type InstallSnapshotReply struct {
-	Term int64
-}
-
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	DPrintln(Exp2D, Info, "Raft %d received InstallSnapshot from %d.", rf.me, args.LeaderId)
-
-	if args.Term < rf.currentTerm {
-		DPrintln(Exp2D, Warning, "Raft %d rejected InstallSnapshot from %d because of smaller term.",
-			rf.me, args.LeaderId)
-		reply.Term = rf.currentTerm
-		return
-	}
-
-	role := atomic.LoadInt64(&rf.role)
-
-	// Convert to follower
-	if role != RoleFollower {
-		DPrintln(Exp2D, Warning, "Raft %d is not follower when receiving InstallSnapshot from %d.",
-			rf.me, args.LeaderId)
-	}
-	atomic.StoreInt64(&rf.role, RoleFollower)
-	if args.Term > reply.Term {
-		rf.fastForwardToTerm(args.Term, false, true)
-		role = RoleFollower
-	}
-	reply.Term = rf.currentTerm
-
-	// Valid request from leader, update related variables
-	atomic.StoreInt64(&rf.LeaderId, int64(args.LeaderId))
-	rf.lastRPC.Set()
-
-	ok, entry := rf.logs.At(args.LastIncludedIndex)
-	if ok == LogNotFound {
-		DPrintln(Exp2D, Error, "Raft %d cannot find log entry[%d] specified by InstallSnapshot.",
-			rf.me, args.LastIncludedIndex)
-	}
-
-	// 6. If existing log entry has same index and term as snapshot's last included entry, retain log
-	//    entries following it and reply
-	if args.Term == entry.Term {
-		rf.logs.Compact(args.LastIncludedIndex, args.Data)
-		return
-	}
-
-	rf.logs.Reset(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
-
-	applyMsg := ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotIndex: args.LastIncludedIndex,
-		SnapshotTerm:  int(args.LastIncludedTerm),
-	}
-	rf.applyCh <- applyMsg
-
-	DPrintln(Exp2B, Important, "Raft %d successfully installed snapshot to index %d, term %d.",
-		rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
-}
-
-func (rf *Raft) sendInstallSnapshot(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// DPrintln(Exp2D, Info, "Raft %d sending InstallSnapshot to %d.", rf.me, server)
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -754,6 +747,7 @@ func (rf *Raft) logApplier() {
 
 		rf.mu.RLock()
 		ok, entry := rf.logs.At(int(applyIndex))
+		// offset := int(applyIndex) - rf.logs.LastIndex
 		rf.mu.RUnlock()
 
 		if ok != LogExist {
@@ -765,6 +759,7 @@ func (rf *Raft) logApplier() {
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: int(applyIndex) + 1,
+			// CommandIndex: offset,
 		}
 		rf.applyCh <- applyMsg
 
@@ -938,7 +933,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	DPrintln(Exp2B, Log, "Raft %d starts agreement on term %d, index %d.", rf.me, term, index)
 
-	return index + 1, int(term), isLeader
+	return index, int(term), isLeader
 }
 
 //
@@ -1042,20 +1037,33 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int,
 	}
 
 	args.PrevLogIndex = head - 1
-	if head == 0 {
-		args.PrevLogTerm = -1
-	} else {
-		_, entry := rf.logs.At(head - 1)
+	ok, entry := rf.logs.At(args.PrevLogIndex)
+	if (ok == LogExist && args.PrevLogIndex >= 0) || ok == LogTermOnly {
+		// Log segment [head:logLen] still exists, and does not overlap snapshot
 		args.PrevLogTerm = entry.Term
+		args.Entries = rf.logs.GetSuffix(head)
+	} else if ok != LogNotFound {
+		// Log is compacted, send snapshot
+		head = 0
+		args.PrevLogIndex = -1
+		args.PrevLogTerm = -1
+
+		args.SnapshotValid = true
+		args.SnapshotLastIndex = rf.logs.LastIndex
+		args.SnapshotLastTerm = rf.logs.LastTerm
+		args.Snapshot = rf.logs.Snapshot
+
+		args.Entries = rf.logs.GetSuffix(rf.logs.LastIndex + 1)
+	} else {
+		DPrintln(Exp2D, Error, "Raft %d tries to send log[%d:%d] but head does not exist!",
+			rf.me, head, logLen)
 	}
-	_, suffix := rf.logs.GetSuffix(head)
-	args.Entries = suffix
 	rf.mu.RUnlock()
 
 	args.LeaderCommit = atomic.LoadInt64(&rf.commitIndex)
 
-	ok := rf.sendAppendEntries(server, &args, &reply)
-	if !ok {
+	rpcOk := rf.sendAppendEntries(server, &args, &reply)
+	if !rpcOk {
 		return RPCLost, 0, -1
 	}
 
@@ -1196,6 +1204,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// initialize from state persisted before a crash
 	// rf.readPersist(persister.ReadRaftState())
+	rf.snapshotLock = sync.Mutex{}
+	rf.snapshotCond = sync.Cond{L: &rf.snapshotLock}
 
 	// beat my heart
 	go rf.heart()
