@@ -261,6 +261,7 @@ type Raft struct {
 	snapshotLock      sync.Mutex // snapshot lock
 	snapshotCond      sync.Cond  // snapshot condvar, to wait in an AppendEntries for snapshot installing
 	snapshotInstalled bool       // use with condvar to indicate a successful install
+	snapshotInited    bool       // if not set, should apply current snapshot
 }
 
 const (
@@ -381,6 +382,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = -1
 		// DPrintln(Exp2C, Warning, "Raft %d setting votedFor = -1", rf.me)
 		rf.logs = LogWithSnapshot{Snapshot: nil, LastIndex: -1, LastTerm: -1, Logs: make([]LogEntry, 0)}
+		rf.snapshotInited = true
 		return
 	}
 
@@ -395,9 +397,9 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 
 	// Recover from snapshot if it exists
-	// if rf.logs.LastIndex >= 0 {
-	// 	rf.syncInstallSnapshot()
-	// }
+	if rf.logs.LastIndex >= 0 {
+		go rf.syncInstallSnapshot()
+	}
 
 	DPrintln(Exp2C, Info, "Raft %d successfully decoded {term = %d, vote = %d, log = %v}.",
 		rf.me, rf.currentTerm, rf.votedFor, rf.logs)
@@ -1203,9 +1205,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	// Initialize persistent state
-	rf.readPersist(persister.ReadRaftState())
-
 	// Initialize volatile state
 	rf.commitIndex = -1
 	rf.lastApplied = -1
@@ -1218,6 +1217,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// rf.readPersist(persister.ReadRaftState())
 	rf.snapshotLock = sync.Mutex{}
 	rf.snapshotCond = sync.Cond{L: &rf.snapshotLock}
+
+	// Initialize persistent state
+	// Put here because maybe we should install a snapshot
+	rf.readPersist(persister.ReadRaftState())
 
 	// beat my heart
 	go rf.heart()
