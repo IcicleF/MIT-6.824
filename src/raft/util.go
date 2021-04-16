@@ -27,7 +27,7 @@ const (
 )
 
 const ShownLogLevel = Info
-const ShownPhase = Exp2
+const ShownPhase = 0
 const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {

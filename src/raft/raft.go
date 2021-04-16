@@ -395,9 +395,9 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 
 	// Recover from snapshot if it exists
-	if rf.logs.LastIndex >= 0 {
-		rf.syncInstallSnapshot()
-	}
+	// if rf.logs.LastIndex >= 0 {
+	// 	rf.syncInstallSnapshot()
+	// }
 
 	DPrintln(Exp2C, Info, "Raft %d successfully decoded {term = %d, vote = %d, log = %v}.",
 		rf.me, rf.currentTerm, rf.votedFor, rf.logs)
@@ -415,12 +415,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.snapshotLock.Lock()
 	defer rf.snapshotLock.Unlock()
 
-	// Signals the condvar to continue AppendEntries
+	// Signals the condvar to terminate syncInstallSnapshot
 	rf.snapshotInstalled = true
 	rf.snapshotCond.Signal()
 
-	// CondInstallSnapshot always returns true
-	return true
+	return lastIncludedIndex >= int(atomic.LoadInt64(&rf.lastApplied))
 }
 
 // the service says it has created a snapshot that has
@@ -659,9 +658,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 3. If an existing entry conflicts with a new one, delete the existing entry and all that follows it
 	// 4. Append any new entries not already in the log
-	lastEntry := rf.logs.Len() - 1
+	lastNewEntry := args.PrevLogIndex + args.SnapshotLastIndex + 1 + len(args.Entries)
 	if len(args.Entries) > 0 || args.SnapshotValid {
-		DPrintln(Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %+v.",
+		DPrintln(Exp2B|Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %v.",
 			rf.me, args.LeaderId, args.PrevLogIndex, rf.logs)
 
 		localLogCheckOffset := 0
@@ -676,7 +675,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if needInstall {
 				DPrintln(Exp2D, Info, "Raft %d received newer snapshot from %d and decided to install snapshot %v.",
 					rf.me, args.LeaderId, args.Snapshot)
-				rf.syncInstallSnapshot()
+				go rf.syncInstallSnapshot()
 			}
 		} else {
 			if args.PrevLogIndex+1 <= rf.logs.LastIndex {
@@ -707,18 +706,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		if logChanged {
-			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, log = %+v.", rf.me, args.LeaderId, rf.logs)
+			DPrintln(Exp2B|Exp2C, Info, "Raft %d: after AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
 			rf.persist()
 
-			lastEntry = rf.logs.Len() - 1
+			lastNewEntry = rf.logs.Len() - 1
 		} else {
-			DPrintln(Exp2C, Info, "Raft %d: after AE from %d, unchanged.", rf.me, args.LeaderId)
+			DPrintln(Exp2B|Exp2C, Info, "Raft %d: after AE from %d, unchanged.", rf.me, args.LeaderId)
 		}
 	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > atomic.LoadInt64(&rf.commitIndex) {
-		atomic.StoreInt64(&rf.commitIndex, min(args.LeaderCommit, int64(lastEntry)))
+		atomic.StoreInt64(&rf.commitIndex, min(args.LeaderCommit, int64(lastNewEntry)))
 		rf.applyCond.Signal()
 	}
 }
@@ -742,16 +741,16 @@ func (rf *Raft) logApplier() {
 		}
 
 		// Start applying the log
-		rf.lastApplied++
-		applyIndex := rf.lastApplied
+		applyIndex := atomic.AddInt64(&rf.lastApplied, 1)
 
 		rf.mu.RLock()
 		ok, entry := rf.logs.At(int(applyIndex))
-		// offset := int(applyIndex) - rf.logs.LastIndex
+		lastIndex := rf.logs.LastIndex
 		rf.mu.RUnlock()
 
 		if ok != LogExist {
-			DPrintln(Exp2D, Warning, "Raft %d cannot apply log[%d] since it does not exist.", rf.me, applyIndex)
+			atomic.StoreInt64(&rf.lastApplied, int64(lastIndex))
+			DPrintln(Exp2D, Info, "Raft %d fast-forwarded applyIndex to %d.", rf.me, applyIndex)
 			continue
 		}
 
@@ -759,17 +758,16 @@ func (rf *Raft) logApplier() {
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: int(applyIndex) + 1,
-			// CommandIndex: offset,
 		}
 		rf.applyCh <- applyMsg
 
 		DPrintln(Exp2B, Important, "Raft %d successfully applied log %v.", rf.me, applyMsg)
-		// rf.tracer.Append(fmt.Sprintf("Applied log[%d] = %+v.", applyIndex, entry))
+		time.Sleep(time.Millisecond)
 	}
 }
 
 func (rf *Raft) logReplicator(server int) {
-	const continuousRejectThreshold = 5
+	const continuousRejectThreshold = 10
 
 	for !rf.killed() {
 		time.Sleep(time.Millisecond * 10)
@@ -802,7 +800,7 @@ func (rf *Raft) logReplicator(server int) {
 					break
 				}
 
-				ok, logLen, replUntil := rf.doSendAppendEntries(server, term, int(nextIndex))
+				ok, logLen, replUntil := rf.doSendAppendEntries(server, term, int(nextIndex), true)
 				if ok == RPCRetracted {
 					break
 				}
@@ -926,12 +924,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Starts agreement
 	term := rf.currentTerm
-	index := rf.logs.Len()
+	index := rf.logs.Len() + 1
 	// rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
 	rf.logs.Append(LogEntry{Term: term, Command: command})
 	rf.persist()
 
-	DPrintln(Exp2B, Log, "Raft %d starts agreement on term %d, index %d.", rf.me, term, index)
+	DPrintln(Exp2B, Info, "Raft %d starts agreement on term %d, index %d.", rf.me, term, index)
 
 	return index, int(term), isLeader
 }
@@ -962,7 +960,7 @@ const (
 	BroadcastHeartbeat
 )
 
-func (rf *Raft) broadcast(kind int, term int64) {
+func (rf *Raft) broadcast(kind int, term int64, ext bool) {
 	if kind == BroadcastHeartbeat && atomic.LoadInt64(&rf.role) != RoleLeader {
 		return
 	}
@@ -974,7 +972,10 @@ func (rf *Raft) broadcast(kind int, term int64) {
 		case BroadcastRequestVote:
 			go rf.doSendRequestVote(i, term)
 		case BroadcastHeartbeat:
-			go rf.doSendAppendEntries(i, term, -1)
+			rf.indexesLock.RLock()
+			nextIndex := rf.nextIndex[i]
+			rf.indexesLock.RUnlock()
+			go rf.doSendAppendEntries(i, term, int(nextIndex), ext)
 		}
 	}
 }
@@ -1022,8 +1023,8 @@ func (rf *Raft) doSendRequestVote(server int, term int64) int {
 }
 
 // Returns (RPCStatus, RemoteLogLen, LocalReplicatedLogEnd)
-func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int, int) {
-	DPrintln(Exp2A, Log, "Raft %d: doSendAppendEntries to %d", rf.me, server)
+func (rf *Raft) doSendAppendEntries(server int, term int64, head int, isAppend bool) (int, int, int) {
+	// DPrintln(Exp2A, Log, "Raft %d: doSendAppendEntries to %d", rf.me, server)
 
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
@@ -1032,31 +1033,40 @@ func (rf *Raft) doSendAppendEntries(server int, term int64, head int) (int, int,
 	args.Term = term
 	args.LeaderId = rf.me
 	logLen := rf.logs.Len()
-	if head < 0 {
-		head = logLen
-	}
 
 	args.PrevLogIndex = head - 1
+	args.SnapshotValid = false
+	args.SnapshotLastIndex = -1
+	args.SnapshotLastTerm = -1
+
 	ok, entry := rf.logs.At(args.PrevLogIndex)
-	if (ok == LogExist && args.PrevLogIndex >= 0) || ok == LogTermOnly {
-		// Log segment [head:logLen] still exists, and does not overlap snapshot
-		args.PrevLogTerm = entry.Term
-		args.Entries = rf.logs.GetSuffix(head)
-	} else if ok != LogNotFound {
-		// Log is compacted, send snapshot
-		head = 0
-		args.PrevLogIndex = -1
-		args.PrevLogTerm = -1
+	if isAppend {
+		if (ok == LogExist && args.PrevLogIndex >= 0) || ok == LogTermOnly {
+			// Log segment [head:logLen] still exists, and does not overlap snapshot
+			args.PrevLogTerm = entry.Term
+			args.Entries = rf.logs.GetSuffix(head)
+		} else if ok != LogNotFound {
+			// Log is compacted, send snapshot
+			head = 0
+			args.PrevLogIndex = -1
+			args.PrevLogTerm = -1
 
-		args.SnapshotValid = true
-		args.SnapshotLastIndex = rf.logs.LastIndex
-		args.SnapshotLastTerm = rf.logs.LastTerm
-		args.Snapshot = rf.logs.Snapshot
+			if rf.logs.LastIndex >= 0 {
+				args.SnapshotValid = true
+				args.SnapshotLastIndex = rf.logs.LastIndex
+				args.SnapshotLastTerm = rf.logs.LastTerm
+				args.Snapshot = rf.logs.Snapshot
+			}
 
-		args.Entries = rf.logs.GetSuffix(rf.logs.LastIndex + 1)
+			args.Entries = rf.logs.GetSuffix(rf.logs.LastIndex + 1)
+		} else {
+			DPrintln(Exp2D, Error, "Raft %d tries to send log[%d:%d] but head does not exist!",
+				rf.me, head, logLen)
+		}
 	} else {
-		DPrintln(Exp2D, Error, "Raft %d tries to send log[%d:%d] but head does not exist!",
-			rf.me, head, logLen)
+		// Heartbeat, send no entries
+		args.PrevLogTerm = entry.Term
+		args.Entries = make([]LogEntry, 0)
 	}
 	rf.mu.RUnlock()
 
@@ -1126,7 +1136,7 @@ func (rf *Raft) ticker() {
 				timeout := time.Millisecond * time.Duration(rnd(TimeoutMin, TimeoutMax))
 
 				atomic.StoreInt64(&rf.receivedVotes, 1)
-				rf.broadcast(BroadcastRequestVote, term)
+				rf.broadcast(BroadcastRequestVote, term, false)
 
 				startTime := time.Now()
 				// as long as I am still a candidate
@@ -1146,7 +1156,7 @@ func (rf *Raft) ticker() {
 						rf.initFollowerIndexes()
 						atomic.StoreInt64(&rf.LeaderId, int64(rf.me))
 						atomic.StoreInt64(&rf.role, RoleLeader)
-						rf.broadcast(BroadcastHeartbeat, term)
+						rf.broadcast(BroadcastHeartbeat, term, false)
 					}
 					time.Sleep(time.Millisecond * 10)
 				}
@@ -1163,10 +1173,12 @@ func (rf *Raft) ticker() {
 
 // The heart is responsible to send out heartbeats when I am leader.
 func (rf *Raft) heart() {
+	i := 0
 	for !rf.killed() {
 		term, role := rf.GetTermAndRole()
 		if role == RoleLeader {
-			rf.broadcast(BroadcastHeartbeat, term)
+			rf.broadcast(BroadcastHeartbeat, term, i%10 == 0)
+			i++
 		}
 		time.Sleep(time.Millisecond * TimeoutHeartbeat)
 	}
