@@ -5,22 +5,32 @@ const (
 	ErrNoKey
 	ErrWrongLeader
 	ErrLostLeadership
+	ErrUnknown
 )
 
 type Err int
+type RPCReply interface {
+	GetErr() Err
+	GetLeader() int // [!!!!] Hole: Raft ID might be different from KVServer ID
+}
 
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err           Err
+	CorrectLeader int
+}
+
+func (par PutAppendReply) GetErr() Err {
+	return par.Err
+}
+func (par PutAppendReply) GetLeader() int {
+	return par.CorrectLeader
 }
 
 type GetArgs struct {
@@ -29,6 +39,14 @@ type GetArgs struct {
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+	Err           Err
+	Value         string
+	CorrectLeader int
+}
+
+func (gr GetReply) GetErr() Err {
+	return gr.Err
+}
+func (gr GetReply) GetLeader() int {
+	return gr.CorrectLeader
 }

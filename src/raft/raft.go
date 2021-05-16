@@ -316,6 +316,17 @@ func (rf *Raft) GetTermAndRole() (int64, int64) {
 	return rf.currentTerm, atomic.LoadInt64(&rf.role)
 }
 
+// Returns a leader (maybe)
+func (rf *Raft) GetLeaderMaybe() int {
+	role := atomic.LoadInt64(&rf.role)
+	if role == RoleCandidate {
+		// If I am a candidate, then I don't think there is a leader
+		return -1
+	}
+	res := atomic.LoadInt64(&rf.LeaderId)
+	return int(res)
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -1206,6 +1217,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// Your initialization code here (2A, 2B, 2C).
 	// Initialize volatile state
+	rf.LeaderId = -1
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.applyCh = applyCh
