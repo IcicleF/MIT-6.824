@@ -33,9 +33,9 @@ const (
 	Exp3AB = 0x7
 )
 
-const ShownLogLevel = Info
+const ShownLogLevel = Log
 const ShownPhase = Exp3A1
-const CancelColoring = false
+const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
 	if typ == Error || (Debug && ((phase & ShownPhase) != 0) && typ >= ShownLogLevel) {
@@ -88,6 +88,8 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) {
 // END OF SELF-DEFINED DEBUGGING LIBRARY
 // ===========================================================================================
 
+const MaxTolerableOpsPerServer int64 = 100000000
+
 const (
 	Undef = iota
 	PutOp
@@ -137,7 +139,7 @@ func (kv *KVServer) perform(op Op) Response {
 	DPrintln(Exp3A1, Log, "KV %d received RPC of op %+v.", kv.me, op)
 
 	// Try to start an agreement, and reject RPC if not leader
-	id := atomic.AddInt64(&kv.uniqueId, 1)
+	id := atomic.AddInt64(&kv.uniqueId, 1) + int64(kv.me)*MaxTolerableOpsPerServer
 	op.Id = id
 	index, _, isLeader := kv.rf.Start(op)
 
@@ -151,7 +153,7 @@ func (kv *KVServer) perform(op Op) Response {
 	DPrintln(Exp3A1, Log, "KV %d informed Raft of op[%d] = %+v.", kv.me, index, op)
 	for !kv.killed() {
 		// Sleep first
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 1)
 
 		// Check then
 		kv.mu.Lock()
