@@ -34,7 +34,7 @@ const (
 )
 
 const ShownLogLevel = Log
-const ShownPhase = Exp3A1
+const ShownPhase = 0
 const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
@@ -88,7 +88,27 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) {
 // END OF SELF-DEFINED DEBUGGING LIBRARY
 // ===========================================================================================
 
-const MaxTolerableOpsPerServer int64 = 100000000
+// ===========================================================================================
+// BEGIN OF THREAD-UNSAFE SET
+
+type void struct{}
+
+type Set struct {
+	set map[int64]void
+}
+
+func (s *Set) Insert(x int64) bool {
+	_, ok := s.set[x]
+	if ok {
+		return false
+	}
+	var member void
+	s.set[x] = member
+	return true
+}
+
+// END OF THREAD-UNSAFE SET
+// ===========================================================================================
 
 const (
 	Undef = iota
@@ -126,11 +146,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store          map[string]string // The real KV store
-	uniqueId       int64             // A unique ID for all requests to distinguish them
-	received       map[int]Op        // Received applyMsgs and their
-	receivedCount  int64             // Received applyMsgs from Raft
-	performedCount int64             // Performed applyMsgs to KV
+	store    map[string]string // The real KV store
+	uniqueId int64             // A unique ID for all requests to distinguish them
+	received map[int]Op        // Received applyMsgs and their
+	executed Set               // Deduplication
 }
 
 func (kv *KVServer) perform(op Op) Response {
@@ -139,9 +158,7 @@ func (kv *KVServer) perform(op Op) Response {
 	DPrintln(Exp3A1, Log, "KV %d received RPC of op %+v.", kv.me, op)
 
 	// Try to start an agreement, and reject RPC if not leader
-	id := atomic.AddInt64(&kv.uniqueId, 1) + int64(kv.me)*MaxTolerableOpsPerServer
-	op.Id = id
-	index, _, isLeader := kv.rf.Start(op)
+	index, term, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -159,38 +176,28 @@ func (kv *KVServer) perform(op Op) Response {
 		kv.mu.Lock()
 		val, ok := kv.received[index]
 		kv.mu.Unlock()
+		rfTerm, stillLeader := kv.rf.GetState()
+		if rfTerm != term || !stillLeader {
+			// Raft shifts to a new state
+			reply.Err = ErrLostLeadership
+			return reply
+		}
 
 		if !ok {
 			continue
 		}
-		if val.Id != id {
-			DPrintln(Exp3A1, Warning, "KV %d found op id %d is not confirmed.", kv.me, id)
+		if val.Id != op.Id {
+			DPrintln(Exp3A1, Warning, "KV %d found op id %d is not confirmed.", kv.me, op.Id)
 			reply.Err = ErrLostLeadership
 			return reply
 		}
-		DPrintln(Exp3A1, Log, "KV %d received confirmation of op[%d] = %+v.", kv.me, index, op)
 
-		// Wait until all previous ops are performed
-		for int(atomic.LoadInt64(&kv.performedCount)) != index-1 {
-			time.Sleep(time.Millisecond * 10)
-		}
-		DPrintln(Exp3A1, Log, "KV %d detected all ops before %d are performed.", kv.me, index)
-
-		// Perform KV op
 		kv.mu.Lock()
-		if op.Type == PutOp {
-			kv.store[op.Key] = op.Value
-		} else if op.Type == AppendOp {
-			kv.store[op.Key] = kv.store[op.Key] + op.Value
-		} else if op.Type == GetOp {
+		if op.Type == GetOp {
 			reply.Value = kv.store[op.Key]
-		} else {
-			reply.Err = ErrUnknown
-			return reply
 		}
-		atomic.AddInt64(&kv.performedCount, 1)
-		DPrintln(Exp3A1, Log, "KV %d performed op[%d] = %+v.", kv.me, index, op)
 		kv.mu.Unlock()
+
 		break
 	}
 	return reply
@@ -198,7 +205,7 @@ func (kv *KVServer) perform(op Op) Response {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	op := Op{Type: GetOp, Key: args.Key}
+	op := Op{Type: GetOp, Key: args.Key, Id: args.Id}
 	res := kv.perform(op)
 	reply.Err = res.Err
 	reply.Value = res.Value
@@ -207,7 +214,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	op := Op{Type: str2op(args.Op), Key: args.Key, Value: args.Value}
+	op := Op{Type: str2op(args.Op), Key: args.Key, Value: args.Value, Id: args.Id}
 	res := kv.perform(op)
 	reply.Err = res.Err
 	reply.CorrectLeader = res.CorrectLeader
@@ -223,8 +230,19 @@ func (kv *KVServer) poller() {
 				DPrintln(Exp3AB, Error, "KV %d detects a command that is not of type Op!", kv.me)
 			}
 
+			DPrintln(Exp3A1, Log, "KV %d received confirmation of op[%d] = %+v.", kv.me, m.CommandIndex, op)
+
+			// Record & execute
 			kv.mu.Lock()
 			kv.received[m.CommandIndex] = op
+			if kv.executed.Insert(op.Id) {
+				// If not duplicate
+				if op.Type == PutOp {
+					kv.store[op.Key] = op.Value
+				} else if op.Type == AppendOp {
+					kv.store[op.Key] = kv.store[op.Key] + op.Value
+				}
+			}
 			kv.mu.Unlock()
 		}
 	}
@@ -278,8 +296,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.store = make(map[string]string)
 	kv.uniqueId = 0
 	kv.received = make(map[int]Op)
-	kv.performedCount = 0
-	kv.receivedCount = 0
+	kv.executed.set = make(map[int64]void)
+	// kv.performedCount = 0
+	// kv.receivedCount = 0
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)

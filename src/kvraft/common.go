@@ -19,6 +19,7 @@ type PutAppendArgs struct {
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
+	Id    int64
 }
 
 type PutAppendReply struct {
@@ -35,7 +36,7 @@ func (par PutAppendReply) GetLeader() int {
 
 type GetArgs struct {
 	Key string
-	// You'll have to add definitions here.
+	Id  int64
 }
 
 type GetReply struct {

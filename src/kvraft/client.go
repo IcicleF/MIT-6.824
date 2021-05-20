@@ -35,7 +35,7 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 	var res RPCReply
 	if ck.lastLeader >= 0 {
 		res = closure(ck.lastLeader)
-		if res.GetErr() == OK {
+		if res != nil && res.GetErr() == OK {
 			return res
 		}
 	}
@@ -46,16 +46,19 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 		// Dispatch request to current "leader"
 		DPrintln(Exp3A1, Log, "Clerk: examining server %d...", leader)
 		reply := closure(leader)
-		if err := reply.GetErr(); err == OK {
-			// Correct!
-			DPrintln(Exp3A1, Log, "Clerk: server %d is leader!", leader)
-			ck.lastLeader = leader
-			return reply
+		if reply != nil {
+			// If the server replied correctly
+			if err := reply.GetErr(); err == OK {
+				// Correct!
+				DPrintln(Exp3A1, Log, "Clerk: server %d is leader!", leader)
+				ck.lastLeader = leader
+				return reply
+			}
 		}
 
 		// Move to next leader, and wait for a short period of time
 		leader = (leader + 1) % len(ck.servers)
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 1)
 	}
 
 	// Control flow should never reach this return
@@ -76,11 +79,15 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 //
 func (ck *Clerk) Get(key string) string {
 	DPrintln(Exp3A1, Log, "Clerk: Get(%s)", key)
+	id := nrand()
 	closure := func(server int) RPCReply {
-		args := GetArgs{Key: key}
+		args := GetArgs{Key: key, Id: id}
 		reply := GetReply{}
 
-		ck.servers[server].Call("KVServer.Get", &args, &reply)
+		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			return nil
+		}
 		return reply
 	}
 	reply := ck.dispatch(closure)
@@ -108,12 +115,15 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	DPrintln(Exp3A1, Log, "Clerk: %s(%s, %s)", op, key, value)
-	// You will have to modify this function.
+	id := nrand()
 	closure := func(server int) RPCReply {
-		args := PutAppendArgs{Key: key, Value: value, Op: op}
+		args := PutAppendArgs{Key: key, Value: value, Op: op, Id: id}
 		reply := PutAppendReply{}
 
-		ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			return nil
+		}
 		return reply
 	}
 	reply := ck.dispatch(closure)
