@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"sync"
@@ -126,7 +127,6 @@ type KVServer struct {
 
 	// Your definitions here.
 	store         map[string]string // The real KV store
-	uniqueId      int64             // A unique ID for all requests to distinguish them
 	receivedIndex int
 	executed      map[int64]int64 // Deduplication
 }
@@ -245,6 +245,32 @@ func (kv *KVServer) poller() {
 	}
 }
 
+func (kv *KVServer) snapshotter(persister *raft.Persister) {
+	if kv.maxraftstate < 0 {
+		// No need to snapshot
+		return
+	}
+
+	threshold := kv.maxraftstate / 10 * 8 // 80% of max size
+	for !kv.killed() {
+		time.Sleep(time.Millisecond * 10)
+
+		stateSize := persister.RaftStateSize()
+		if stateSize >= threshold {
+			kv.mu.Lock()
+			index := kv.receivedIndex
+
+			buf := new(bytes.Buffer)
+			enc := labgob.NewEncoder(buf)
+			enc.Encode(kv.executed)
+			snapshot := buf.Bytes()
+
+			kv.rf.Snapshot(index, snapshot)
+			kv.mu.Unlock()
+		}
+	}
+}
+
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
@@ -291,7 +317,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
-	kv.uniqueId = 0
 	kv.receivedIndex = 0
 	kv.executed = make(map[int64]int64)
 	// kv.performedCount = 0
@@ -302,6 +327,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.poller()
+	go kv.snapshotter(persister)
 
 	return kv
 }
