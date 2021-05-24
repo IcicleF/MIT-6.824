@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	"6.824/labrpc"
@@ -12,6 +13,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 
 	lastLeader int
+	cliId      int64
+	seqId      int64
 }
 
 func nrand() int64 {
@@ -27,6 +30,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	// You'll have to add code here.
 	ck.lastLeader = -1
+	ck.cliId = nrand()
+	ck.seqId = 0
 
 	return ck
 }
@@ -42,7 +47,7 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 
 	// Start finding leader
 	leader := 0
-	for true {
+	for {
 		// Dispatch request to current "leader"
 		DPrintln(Exp3A1, Log, "Clerk: examining server %d...", leader)
 		reply := closure(leader)
@@ -53,16 +58,17 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 				DPrintln(Exp3A1, Log, "Clerk: server %d is leader!", leader)
 				ck.lastLeader = leader
 				return reply
+			} else {
+				DPrintln(Exp3A1, Log, "Clerk: server %d report it is not leader...", leader)
 			}
+		} else {
+			DPrintln(Exp3A1, Warning, "Clerk: server %d did not return.", leader)
 		}
 
 		// Move to next leader, and wait for a short period of time
 		leader = (leader + 1) % len(ck.servers)
 		time.Sleep(time.Millisecond * 1)
 	}
-
-	// Control flow should never reach this return
-	return nil
 }
 
 //
@@ -79,9 +85,9 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 //
 func (ck *Clerk) Get(key string) string {
 	DPrintln(Exp3A1, Log, "Clerk: Get(%s)", key)
-	id := nrand()
+	id := atomic.AddInt64(&ck.seqId, 1)
 	closure := func(server int) RPCReply {
-		args := GetArgs{Key: key, Id: id}
+		args := GetArgs{Key: key, CliId: ck.cliId, SeqId: id}
 		reply := GetReply{}
 
 		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
@@ -115,9 +121,9 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	DPrintln(Exp3A1, Log, "Clerk: %s(%s, %s)", op, key, value)
-	id := nrand()
+	id := atomic.AddInt64(&ck.seqId, 1)
 	closure := func(server int) RPCReply {
-		args := PutAppendArgs{Key: key, Value: value, Op: op, Id: id}
+		args := PutAppendArgs{Key: key, Value: value, Op: op, CliId: ck.cliId, SeqId: id}
 		reply := PutAppendReply{}
 
 		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)

@@ -88,28 +88,6 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) {
 // END OF SELF-DEFINED DEBUGGING LIBRARY
 // ===========================================================================================
 
-// ===========================================================================================
-// BEGIN OF THREAD-UNSAFE SET
-
-type void struct{}
-
-type Set struct {
-	set map[int64]void
-}
-
-func (s *Set) Insert(x int64) bool {
-	_, ok := s.set[x]
-	if ok {
-		return false
-	}
-	var member void
-	s.set[x] = member
-	return true
-}
-
-// END OF THREAD-UNSAFE SET
-// ===========================================================================================
-
 const (
 	Undef = iota
 	PutOp
@@ -129,7 +107,8 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Type  int
-	Id    int64
+	CliId int64
+	SeqId int64
 	Key   string
 	Value string
 }
@@ -146,10 +125,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store    map[string]string // The real KV store
-	uniqueId int64             // A unique ID for all requests to distinguish them
-	received map[int]Op        // Received applyMsgs and their
-	executed Set               // Deduplication
+	store         map[string]string // The real KV store
+	uniqueId      int64             // A unique ID for all requests to distinguish them
+	receivedIndex int
+	executed      map[int64]int64 // Deduplication
 }
 
 func (kv *KVServer) perform(op Op) Response {
@@ -174,8 +153,10 @@ func (kv *KVServer) perform(op Op) Response {
 
 		// Check then
 		kv.mu.Lock()
-		val, ok := kv.received[index]
+		receivedIndex := kv.receivedIndex
+		curSeq, ok := kv.executed[op.CliId]
 		kv.mu.Unlock()
+
 		rfTerm, stillLeader := kv.rf.GetState()
 		if rfTerm != term || !stillLeader {
 			// Raft shifts to a new state
@@ -183,18 +164,25 @@ func (kv *KVServer) perform(op Op) Response {
 			return reply
 		}
 
-		if !ok {
+		if receivedIndex < index {
 			continue
 		}
-		if val.Id != op.Id {
-			DPrintln(Exp3A1, Warning, "KV %d found op id %d is not confirmed.", kv.me, op.Id)
+		if !ok || curSeq < op.SeqId {
+			// Index found, however RPC not executed
+			DPrintln(Exp3A1, Warning, "KV %d found op id (%d,%d) is not confirmed.", kv.me, op.CliId, op.SeqId)
 			reply.Err = ErrLostLeadership
 			return reply
 		}
+		// DPrintln(Exp3A1, Log, "KV %d confirmed op id (%d,%d) in its RPC.", kv.me, op.CliId, op.SeqId)
 
 		kv.mu.Lock()
 		if op.Type == GetOp {
-			reply.Value = kv.store[op.Key]
+			val, ok := kv.store[op.Key]
+			if ok {
+				reply.Value = val
+			} else {
+				reply.Value = ""
+			}
 		}
 		kv.mu.Unlock()
 
@@ -204,8 +192,7 @@ func (kv *KVServer) perform(op Op) Response {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	op := Op{Type: GetOp, Key: args.Key, Id: args.Id}
+	op := Op{Type: GetOp, Key: args.Key, CliId: args.CliId, SeqId: args.SeqId}
 	res := kv.perform(op)
 	reply.Err = res.Err
 	reply.Value = res.Value
@@ -213,11 +200,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	op := Op{Type: str2op(args.Op), Key: args.Key, Value: args.Value, Id: args.Id}
+	op := Op{Type: str2op(args.Op), Key: args.Key, Value: args.Value, CliId: args.CliId, SeqId: args.SeqId}
 	res := kv.perform(op)
 	reply.Err = res.Err
 	reply.CorrectLeader = res.CorrectLeader
+	DPrintln(Exp3AB, Log, "KV %d: PutAppend %+v -> %+v", kv.me, args, reply)
 }
 
 func (kv *KVServer) poller() {
@@ -233,17 +220,27 @@ func (kv *KVServer) poller() {
 			DPrintln(Exp3A1, Log, "KV %d received confirmation of op[%d] = %+v.", kv.me, m.CommandIndex, op)
 
 			// Record & execute
-			kv.mu.Lock()
-			kv.received[m.CommandIndex] = op
-			if kv.executed.Insert(op.Id) {
-				// If not duplicate
-				if op.Type == PutOp {
-					kv.store[op.Key] = op.Value
-				} else if op.Type == AppendOp {
-					kv.store[op.Key] = kv.store[op.Key] + op.Value
+			func() {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+
+				kv.receivedIndex = m.CommandIndex
+
+				curSeq, ok := kv.executed[op.CliId]
+				if !ok {
+					kv.executed[op.CliId] = 0
+					curSeq = 0
 				}
-			}
-			kv.mu.Unlock()
+				if curSeq < op.SeqId {
+					// If not duplicate
+					kv.executed[op.CliId] = op.SeqId
+					if op.Type == PutOp {
+						kv.store[op.Key] = op.Value
+					} else if op.Type == AppendOp {
+						kv.store[op.Key] = kv.store[op.Key] + op.Value
+					}
+				}
+			}()
 		}
 	}
 }
@@ -295,8 +292,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
 	kv.uniqueId = 0
-	kv.received = make(map[int]Op)
-	kv.executed.set = make(map[int64]void)
+	kv.receivedIndex = 0
+	kv.executed = make(map[int64]int64)
 	// kv.performedCount = 0
 	// kv.receivedCount = 0
 
