@@ -179,13 +179,12 @@ func (l *LogWithSnapshot) FollowSnapshot(snapshot []byte, index int, term int64)
 		return false
 	}
 
-	// ok, entry := l.At(index)
-	// if ok == LogExist && entry.Term == term {
-	// 	// If I have the last entry of the leader snapshot, I should not discard logs
-	// 	// Instead, I only compact my log to the same length of the leader's
-	// 	l.Compact(index, snapshot)
-	// 	return true, false
-	// }
+	ok, entry := l.At(index)
+	if ok == LogExist && entry.Term == term {
+		// If I have the last entry of the leader snapshot, I should not discard logs nor compact logs
+		// l.Compact(index, snapshot)
+		return false
+	}
 
 	// Otherwise, discard my log and follow the leaders
 	l.Snapshot = snapshot
@@ -692,11 +691,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.SnapshotValid {
 			// Snapshot valid, must be a whole log prefix
 			logChanged = rf.logs.FollowSnapshot(args.Snapshot, args.SnapshotLastIndex, args.SnapshotLastTerm)
-			leaderLogCheckOffset = rf.logs.LastIndex - args.SnapshotLastIndex
 			if logChanged {
 				DPrintln(Exp2D, Info, "Raft %d received newer snapshot from %d and decided to install snapshot %+v.",
 					rf.me, args.LeaderId, args.Snapshot)
 				rf.syncInstallSnapshot()
+			} else {
+				if rf.logs.LastIndex >= args.SnapshotLastIndex {
+					leaderLogCheckOffset = rf.logs.LastIndex - args.SnapshotLastIndex
+				} else {
+					localLogCheckOffset = args.SnapshotLastIndex - rf.logs.LastIndex
+				}
 			}
 		} else {
 			if args.PrevLogIndex+1 <= rf.logs.LastIndex {
@@ -710,6 +714,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 
+		DPrintln(Exp2B, Info, "Raft %d: local %d, leader %d.", rf.me, localLogCheckOffset, leaderLogCheckOffset)
+
 		firstUnmatch := -1
 		for i := 0; i+leaderLogCheckOffset < len(args.Entries); i++ {
 			ok, entry := rf.logs.At(i + localLogCheckOffset + rf.logs.LastIndex + 1)
@@ -720,7 +726,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if firstUnmatch >= 0 {
 			logChanged = true
-			// DPrintln(Exp2B, Info, "Raft %d appending log from index %d.", rf.me, firstUnmatch+localLogCheckOffset+rf.logs.LastIndex+1)
 			rf.logs.AppendFrom(
 				firstUnmatch+localLogCheckOffset+rf.logs.LastIndex+1,
 				args.Entries[firstUnmatch+leaderLogCheckOffset:],
