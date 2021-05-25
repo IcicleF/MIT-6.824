@@ -173,26 +173,26 @@ func (l *LogWithSnapshot) GetSuffix(index int) []LogEntry {
 	return res
 }
 
-func (l *LogWithSnapshot) FollowSnapshot(snapshot []byte, index int, term int64) (bool, bool) {
+func (l *LogWithSnapshot) FollowSnapshot(snapshot []byte, index int, term int64) bool {
 	if l.LastIndex >= index {
 		// My log is no shorter than yours
-		return false, false
+		return false
 	}
 
-	ok, entry := l.At(index)
-	if ok == LogExist && entry.Term == term {
-		// If I have the last entry of the leader snapshot, I should not discard logs
-		// Instead, I only compact my log to the same length of the leader's
-		l.Compact(index, snapshot)
-		return true, false
-	}
+	// ok, entry := l.At(index)
+	// if ok == LogExist && entry.Term == term {
+	// 	// If I have the last entry of the leader snapshot, I should not discard logs
+	// 	// Instead, I only compact my log to the same length of the leader's
+	// 	l.Compact(index, snapshot)
+	// 	return true, false
+	// }
 
 	// Otherwise, discard my log and follow the leaders
 	l.Snapshot = snapshot
 	l.LastIndex = index
 	l.LastTerm = term
 	l.Logs = make([]LogEntry, 0)
-	return true, true
+	return true
 }
 
 // Atomic Timestamper
@@ -370,6 +370,11 @@ func (rf *Raft) PrintState() {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
+	rf.snapshotLock.Lock()
+	defer rf.snapshotLock.Unlock()
+
+	snapshot := rf.logs.Snapshot
+	rf.logs.Snapshot = nil
 
 	buf := new(bytes.Buffer)
 	enc := labgob.NewEncoder(buf)
@@ -378,16 +383,19 @@ func (rf *Raft) persist() {
 	enc.Encode(rf.logs)
 
 	data := buf.Bytes()
-	rf.persister.SaveRaftState(data)
+	// rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 
 	DPrintln(Exp2C, Log, "Raft %d encoded state {term = %d, vote = %d, log = %v}.",
 		rf.me, rf.currentTerm, rf.votedFor, rf.logs)
+
+	rf.logs.Snapshot = snapshot
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		rf.currentTerm = 0
 		rf.votedFor = -1
@@ -406,6 +414,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if dec.Decode(&rf.currentTerm) != nil || dec.Decode(&rf.votedFor) != nil || dec.Decode(&rf.logs) != nil {
 		DPrintln(Exp2C, Error, "Raft %d cannot decode persistent data!")
 	}
+	rf.logs.Snapshot = snapshot
 
 	// Recover from snapshot if it exists
 	if rf.logs.LastIndex >= 0 {
@@ -673,7 +682,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 4. Append any new entries not already in the log
 	lastNewEntry := args.PrevLogIndex + args.SnapshotLastIndex + 1 + len(args.Entries)
 	if len(args.Entries) > 0 || args.SnapshotValid {
-		DPrintln(Exp2B|Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %v.",
+		DPrintln(Exp2B|Exp2C, Info, "Raft %d: before AE from %d (prev %d), log = %+v.",
 			rf.me, args.LeaderId, args.PrevLogIndex, rf.logs)
 
 		localLogCheckOffset := 0
@@ -682,13 +691,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		logChanged := false
 		if args.SnapshotValid {
 			// Snapshot valid, must be a whole log prefix
-			var needInstall bool = false
-			logChanged, needInstall = rf.logs.FollowSnapshot(args.Snapshot, args.SnapshotLastIndex, args.SnapshotLastTerm)
+			logChanged = rf.logs.FollowSnapshot(args.Snapshot, args.SnapshotLastIndex, args.SnapshotLastTerm)
 			leaderLogCheckOffset = rf.logs.LastIndex - args.SnapshotLastIndex
-			if needInstall {
-				DPrintln(Exp2D, Info, "Raft %d received newer snapshot from %d and decided to install snapshot %v.",
+			if logChanged {
+				DPrintln(Exp2D, Info, "Raft %d received newer snapshot from %d and decided to install snapshot %+v.",
 					rf.me, args.LeaderId, args.Snapshot)
-				go rf.syncInstallSnapshot()
+				rf.syncInstallSnapshot()
 			}
 		} else {
 			if args.PrevLogIndex+1 <= rf.logs.LastIndex {
@@ -704,7 +712,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		firstUnmatch := -1
 		for i := 0; i+leaderLogCheckOffset < len(args.Entries); i++ {
-			ok, entry := rf.logs.At(i + localLogCheckOffset)
+			ok, entry := rf.logs.At(i + localLogCheckOffset + rf.logs.LastIndex + 1)
 			if ok != LogExist || entry.Term != args.Entries[i+leaderLogCheckOffset].Term {
 				firstUnmatch = i
 				break
@@ -712,6 +720,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if firstUnmatch >= 0 {
 			logChanged = true
+			// DPrintln(Exp2B, Info, "Raft %d appending log from index %d.", rf.me, firstUnmatch+localLogCheckOffset+rf.logs.LastIndex+1)
 			rf.logs.AppendFrom(
 				firstUnmatch+localLogCheckOffset+rf.logs.LastIndex+1,
 				args.Entries[firstUnmatch+leaderLogCheckOffset:],
@@ -719,7 +728,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		if logChanged {
-			DPrintln(Exp2B|Exp2C, Info, "Raft %d: after AE from %d, log = %v.", rf.me, args.LeaderId, rf.logs)
+			DPrintln(Exp2B|Exp2C, Info, "Raft %d: after AE from %d, log = %+v.", rf.me, args.LeaderId, rf.logs)
 			rf.persist()
 
 			lastNewEntry = rf.logs.Len() - 1
@@ -1232,7 +1241,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// Initialize persistent state
 	// Put here because maybe we should install a snapshot
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// beat my heart
 	go rf.heart()

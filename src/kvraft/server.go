@@ -34,7 +34,7 @@ const (
 	Exp3AB = 0x7
 )
 
-const ShownLogLevel = Log
+const ShownLogLevel = Info
 const ShownPhase = 0
 const CancelColoring = true
 
@@ -124,6 +124,7 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	store         map[string]string // The real KV store
@@ -209,21 +210,40 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) poller() {
 	for m := range kv.applyCh {
+		if kv.killed() {
+			break
+		}
+
 		if m.SnapshotValid {
-			DPrintln(Exp3A, Error, "KV %d detects a snapshot, but not implemented!", kv.me)
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(m.SnapshotTerm, m.SnapshotIndex, m.Snapshot) {
+				DPrintln(Exp3A1, Info, "KV %d installing snapshot till index %d.", kv.me, m.SnapshotIndex)
+				buf := bytes.NewBuffer(m.Snapshot)
+				dec := labgob.NewDecoder(buf)
+
+				if dec.Decode(&kv.store) != nil || dec.Decode(&kv.executed) != nil {
+					DPrintln(Exp3AB, Error, "KV %d cannot decode snapshot!", kv.me)
+				}
+				kv.receivedIndex = m.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		} else if m.CommandValid {
 			op, ok := m.Command.(Op)
 			if !ok {
 				DPrintln(Exp3AB, Error, "KV %d detects a command that is not of type Op!", kv.me)
 			}
 
-			DPrintln(Exp3A1, Log, "KV %d received confirmation of op[%d] = %+v.", kv.me, m.CommandIndex, op)
+			DPrintln(Exp3A, Info, "KV %d received confirmation of op[%d] = %+v.", kv.me, m.CommandIndex, op)
 
 			// Record & execute
 			func() {
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
 
+				if m.CommandIndex != kv.receivedIndex+1 {
+					DPrintln(Exp3AB, Error, "KV %d received index %d out of order (prev %d)!",
+						kv.me, m.CommandIndex, kv.receivedIndex)
+				}
 				kv.receivedIndex = m.CommandIndex
 
 				curSeq, ok := kv.executed[op.CliId]
@@ -240,33 +260,25 @@ func (kv *KVServer) poller() {
 						kv.store[op.Key] = kv.store[op.Key] + op.Value
 					}
 				}
+
+				// Check if there is need to snapshot
+				stateSize := kv.persister.RaftStateSize()
+				if kv.maxraftstate > 0 && stateSize >= kv.maxraftstate/10*8 {
+					DPrintln(Exp3B, Info,
+						"KV %d issues a snapshot to index %d = {store = %+v, executed = %+v} (state size %d).",
+						kv.me, kv.receivedIndex, kv.store, kv.executed, stateSize)
+					index := kv.receivedIndex
+
+					// Snapshot = [store, executed]
+					buf := new(bytes.Buffer)
+					enc := labgob.NewEncoder(buf)
+					enc.Encode(kv.store)
+					enc.Encode(kv.executed)
+					snapshot := buf.Bytes()
+
+					kv.rf.Snapshot(index, snapshot)
+				}
 			}()
-		}
-	}
-}
-
-func (kv *KVServer) snapshotter(persister *raft.Persister) {
-	if kv.maxraftstate < 0 {
-		// No need to snapshot
-		return
-	}
-
-	threshold := kv.maxraftstate / 10 * 8 // 80% of max size
-	for !kv.killed() {
-		time.Sleep(time.Millisecond * 10)
-
-		stateSize := persister.RaftStateSize()
-		if stateSize >= threshold {
-			kv.mu.Lock()
-			index := kv.receivedIndex
-
-			buf := new(bytes.Buffer)
-			enc := labgob.NewEncoder(buf)
-			enc.Encode(kv.executed)
-			snapshot := buf.Bytes()
-
-			kv.rf.Snapshot(index, snapshot)
-			kv.mu.Unlock()
 		}
 	}
 }
@@ -314,6 +326,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
@@ -327,7 +340,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.poller()
-	go kv.snapshotter(persister)
+	// go kv.snapshotter(persister)
 
 	return kv
 }
