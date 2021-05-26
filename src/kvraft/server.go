@@ -128,8 +128,8 @@ type KVServer struct {
 
 	// Your definitions here.
 	store         map[string]string // The real KV store
-	receivedIndex int
-	executed      map[int64]int64 // Deduplication
+	receivedIndex int               // Applied index
+	executed      map[int64]int64   // Deduplication
 }
 
 func (kv *KVServer) perform(op Op) Response {
