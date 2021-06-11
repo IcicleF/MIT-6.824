@@ -55,7 +55,7 @@ func (ck *Clerk) dispatch(closure func(int) RPCReply) RPCReply {
 			// If the server replied correctly
 			if err := reply.GetErr(); err == OK {
 				// Correct!
-				DPrintln(Exp3A1, Log, "Clerk: dispatched op to leader %d!", leader)
+				DPrintln(Exp3A1, Info, "Clerk: dispatched op to leader %d!", leader)
 				ck.lastLeader = leader
 				return reply
 			} else {
