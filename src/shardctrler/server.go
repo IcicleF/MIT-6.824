@@ -27,14 +27,12 @@ const (
 	Error
 	None
 
-	Exp4A  = 0x1
-	Exp4B  = 0x2
-	Exp4AB = 0x3
+	Exp4A = 0x1
 )
 
 const ShownLogLevel = Info
-const ShownPhase = 0
-const CancelColoring = true
+const ShownPhase = Exp4A
+const CancelColoring = false
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
 	if typ == Error || (Debug && ((phase & ShownPhase) != 0) && typ >= ShownLogLevel) {
@@ -315,11 +313,11 @@ func (sc *ShardCtrler) poller() {
 		}
 
 		if m.SnapshotValid {
-			DPrintln(Exp4AB, Error, "Snapshot is not implemented in ShardCtrler!")
+			DPrintln(Exp4A, Error, "Snapshot is not implemented in ShardCtrler!")
 		} else if m.CommandValid {
 			op, ok := m.Command.(Op)
 			if !ok {
-				DPrintln(Exp4AB, Error, "ShardCtrler %d detects a command that is not of type Op!", sc.me)
+				DPrintln(Exp4A, Error, "ShardCtrler %d detects a command that is not of type Op!", sc.me)
 			}
 			DPrintln(Exp4A, Info, "ShardCtrler %d received confirmation of op[%d] = Type %d %+v.",
 				sc.me, m.CommandIndex, op.Type, op.Args)
@@ -330,7 +328,7 @@ func (sc *ShardCtrler) poller() {
 				defer sc.mu.Unlock()
 
 				if m.CommandIndex != sc.receivedIndex+1 {
-					DPrintln(Exp4AB, Error, "ShardCtrler %d received index %d out of order (prev %d)!",
+					DPrintln(Exp4A, Error, "ShardCtrler %d received index %d out of order (prev %d)!",
 						sc.me, m.CommandIndex, sc.receivedIndex)
 				}
 				sc.receivedIndex = m.CommandIndex

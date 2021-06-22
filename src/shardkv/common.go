@@ -10,35 +10,54 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK = iota
+	ErrNoKey
+	ErrWrongGroup
+	ErrWrongLeader
+
+	ErrNotMigrating
+	ErrRejected
 )
 
-type Err string
+type Err int
 
 // Put or Append
 type PutAppendArgs struct {
-	// You'll have to add definitions here.
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	CliId int64
+	SeqId int64
 }
-
 type PutAppendReply struct {
 	Err Err
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	Key   string
+	CliId int64
+	SeqId int64
 }
-
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type MigrateArgs struct {
+	Gid         int // My GID
+	MigratingTo int // My future configuration number
+	ShardId     int // The shard ID I am asking
+}
+type MigrateReply struct {
+	Err      Err               // OK, or ErrWrongLeader, or ErrNotMigrating
+	Shard    map[string]string // The corresponding shard
+	Executed map[int64]int64   // Full executed map for deduplication
+}
+
+type CheckConfigArgs struct {
+	Gid int
+}
+type CheckConfigReply struct {
+	Err Err // OK, or ErrWrongLeader
+	Num int
 }
