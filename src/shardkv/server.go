@@ -462,7 +462,7 @@ func (kv *ShardKV) poller() {
 
 // This coroutine is responsible for two tasks:
 // 1. Detect configuration update at leader when NORMAL, and issues MigrationStart to Raft
-//   1.5. If all two configurations has nothing to do with me, migrates directly
+//   (1) If both configurations have nothing to do with me, migrates directly
 // 2. Detect global update completion when WAITING, and moves to NORMAL
 func (kv *ShardKV) configUpdater() {
 	for !kv.Killed() {
