@@ -104,7 +104,18 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) {
 // 3. 主动拉取 shard，拉取时双方必须均处于 MIGRATING 状态，否则拒绝，发方重试；
 // 4. 拉取回来并 MultiPut 成功后，就可以立即开始对这个 shard 提供服务；
 // 5. issued 在进入新状态后清空（可以防止发起两轮请求）；
-// 6. 处理 join：test 里面不会动态新建和删除 Raft group。因此如果当前和下一个 configuration 里面都没有我的事，我可以直接转移。
+// 6. 处理 join：test 里面不会动态新建和删除 Raft group。因此如果下一个 configuration 里面没有我的事，我可以直接转移过去。
+
+// 程序逻辑：
+// 1. configUpdater 检测到新 configuration，存在 kv.future 里面并提交 MigrationStart；
+// 2. poller -> executeServerOp 检测到 MigrationStart commit
+//   (1) 如果离开 configuration（前一个与我有关，下一个与我无关）：保存 oldstore，立即迁移至 NORMAL(n+1)；
+//   (2) 如果前后都在 configuration 外，不覆盖写 oldstore，并且立即迁移至 NORMAL(n+1)；
+//   (3) 否则，迁移至 MIGRATING；
+// 3. shardPuller 检测到 MIGRATING 并确认 Raft 状态，如果是 leader，开始拉取 shard；
+// 4. shardPuller::pullShard 通过 RPC 取得 shard 并提交给 Raft；
+// 5. poller -> executeServerOp 检测到 Migrate commit，整合进 KV store，并在接受完时将 kv.future 变为当前 config，迁移到 WAITING；
+// 6. configUpdater 检测到全局更新完成并迁移到 NORMAL。
 
 // END OF DESCRIPTION
 // ===========================================================================================
@@ -173,12 +184,21 @@ type ShardKV struct {
 	executed      map[int64]int64   // Deduplication
 	store         map[string]string // Real KV store
 	oldstore      map[string]string // Snapshotted KV store
+	oldstoreNum   int               // Configuration number of oldstore
 	servable      [NShards]bool     // Shards that I can serve now
 	issued        int64             // Whether MigrationStart or ShardPull are issued (VOLATILE)
 }
 
-func copyMap(src map[string]string) map[string]string {
+func copyStore(src map[string]string) map[string]string {
 	res := map[string]string{}
+	for k, v := range src {
+		res[k] = v
+	}
+	return res
+}
+
+func copyExecuted(src map[int64]int64) map[int64]int64 {
+	res := map[int64]int64{}
 	for k, v := range src {
 		res[k] = v
 	}
@@ -191,6 +211,10 @@ func (kv *ShardKV) getServable(config shardctrler.Config) [NShards]bool {
 		res[i] = (config.Shards[i] == kv.gid)
 	}
 	return res
+}
+
+func (kv *ShardKV) isActive(config shardctrler.Config) bool {
+	return kv.getServable(config) == [NShards]bool{}
 }
 
 func (kv *ShardKV) performClientOp(op ClientOp) (Err, string) {
@@ -271,6 +295,44 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintln(Exp4B, Log, "KV (%d, %d, config %d): PutAppend %+v -> %+v.", kv.gid, kv.me, kv.config.Num, args, reply)
 }
 
+func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// If I am not leader, reject
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// If I haven't progressed to (or over) MIGRATING(args.MigrateTo), reject
+	if kv.config.Num+1 < args.MigratingTo || (kv.config.Num+1 == args.MigratingTo && kv.state == NORMAL) {
+		DPrintln(Exp4B, Log, "KV (%d, %d, config %d), rejected Migrate (to %d) because not yet proceeded.",
+			kv.gid, kv.me, kv.config.Num, args.MigratingTo)
+		reply.Err = ErrNotMigrating
+		return
+	}
+
+	// If configuration number does not match, reject
+	if kv.oldstoreNum+1 != args.MigratingTo {
+		DPrintln(Exp4B, Warning, "KV (%d, %d, config %d) rejected Migrate (to %d) because oldstoreNum (%d) not match!",
+			kv.gid, kv.me, kv.config.Num, args.MigratingTo, kv.oldstoreNum)
+		reply.Err = ErrRejected
+		return
+	}
+
+	// Migrate
+	reply.Err = OK
+	reply.Executed = copyExecuted(kv.executed)
+	reply.Shard = map[string]string{}
+	for k, v := range kv.store {
+		if key2shard(k) == args.ShardId {
+			reply.Shard[k] = v
+		}
+	}
+}
+
 func (kv *ShardKV) CheckConfig(args *CheckConfigArgs, reply *CheckConfigReply) {
 	// NOTICE: Pay attention to dead locks.
 	kv.mu.Lock()
@@ -338,19 +400,36 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 	op, _ := m.Command.(ServerOp)
 	if op.ShardId == -1 {
 		// This is a MigrationStart
-		// 0. Double-check correctness
+		// Double-check correctness
 		if kv.config.Num+1 != op.MigrateTo {
 			DPrintln(Exp4B, Error, "KV (%d, %d, config %d) trying to migrate to config %d!",
 				kv.gid, kv.me, kv.config.Num, op.MigrateTo)
 		}
 
-		// 1. If I am in NORMAL(n), then I can start migrating to MIGRATING(n+1); otherwise, do nothing
+		// If I am in NORMAL(n), then I can start migrating to MIGRATING(n+1); otherwise, do nothing
 		if atomic.LoadInt64(&kv.state) != NORMAL {
 			return
 		}
 
-		// 2. Snapshot current KV store, and enable service only to those prepared shards
-		kv.oldstore = copyMap(kv.store)
+		// If the next configuration has nothing to do with me, migrate directly to NORMAL(n+1)
+		if !kv.isActive(kv.future) {
+			// If I am active in the old configuration, I should save the current KV store for others
+			if kv.isActive(kv.config) {
+				kv.oldstore = copyStore(kv.store)
+				kv.oldstoreNum = kv.config.Num
+			}
+
+			// Directly migrate to a clean state
+			kv.store = map[string]string{}
+			kv.config = kv.future
+			atomic.StoreInt64(&kv.state, NORMAL)
+			atomic.StoreInt64(&kv.issued, 0)
+			return
+		}
+
+		// Otherwise, snapshot current KV store, and enable service only to those prepared shards
+		kv.oldstore = copyStore(kv.store)
+		kv.oldstoreNum = kv.config.Num
 		for i := 0; i < NShards; i++ {
 			kv.servable[i] = (kv.future.Shards[i] == kv.gid) && (kv.config.Shards[i] == kv.gid || kv.config.Shards[i] == 0)
 		}
@@ -358,7 +437,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 		atomic.StoreInt64(&kv.issued, 0)
 	} else {
 		// This is a MultiPut
-		// 0. Double-check correctness and skip duplicated requests
+		// Double-check correctness and skip duplicated requests
 		if kv.state != MIGRATING {
 			DPrintln(Exp4B, Error, "KV (%d, %d, config %d) does a MultiPut, but not in MIGRATING!",
 				kv.gid, kv.me, kv.config.Num, op.MigrateTo)
@@ -369,20 +448,20 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 			return
 		}
 
-		// 1. Put the shard into KV store
+		// Put the shard into KV store
 		for k, v := range op.Shard {
 			kv.store[k] = v
 		}
 
-		// 2. Merge deduplication information
+		// Merge deduplication information
 		for k, v := range op.Executed {
 			kv.executed[k] = maxi64(kv.executed[k], v)
 		}
 
-		// 3. Enable service to the shard
+		// Enable service to the shard
 		kv.servable[op.ShardId] = true
 
-		// 4. If all shards are prepared, move to WAITING and new configuration
+		// If all shards are prepared, move to WAITING and new configuration
 		if kv.servable == kv.getServable(kv.future) {
 			kv.config = kv.future
 			atomic.StoreInt64(&kv.state, WAITING)
@@ -409,6 +488,7 @@ func (kv *ShardKV) poller() {
 				dec.Decode(&kv.config)
 				dec.Decode(&kv.future)
 				dec.Decode(&kv.oldstore)
+				dec.Decode(&kv.oldstoreNum)
 				dec.Decode(&kv.store)
 				dec.Decode(&kv.executed)
 				dec.Decode(&kv.servable)
@@ -448,6 +528,7 @@ func (kv *ShardKV) poller() {
 				enc.Encode(kv.config)
 				enc.Encode(kv.future)
 				enc.Encode(kv.oldstore)
+				enc.Encode(kv.oldstoreNum)
 				enc.Encode(kv.store)
 				enc.Encode(kv.executed)
 				enc.Encode(kv.servable)
@@ -462,7 +543,6 @@ func (kv *ShardKV) poller() {
 
 // This coroutine is responsible for two tasks:
 // 1. Detect configuration update at leader when NORMAL, and issues MigrationStart to Raft
-//   (1) If both configurations have nothing to do with me, migrates directly
 // 2. Detect global update completion when WAITING, and moves to NORMAL
 func (kv *ShardKV) configUpdater() {
 	for !kv.Killed() {
@@ -507,10 +587,11 @@ func (kv *ShardKV) configUpdater() {
 
 			// If all Raft groups have successfully migrated to WAITING(current.Num), then go NORMAL
 			if accepted {
-				// Clean-up
-				kv.mu.Lock()
-				kv.oldstore = nil
-				kv.mu.Unlock()
+				// Clean-up omitted to prevent potential problems...
+				// kv.mu.Lock()
+				// kv.oldstore = nil
+				// kv.oldstoreNum = 0
+				// kv.mu.Unlock()
 
 				atomic.StoreInt64(&kv.state, NORMAL)
 				atomic.StoreInt64(&kv.issued, 0)
@@ -525,8 +606,6 @@ func (kv *ShardKV) configUpdater() {
 			kv.mu.Lock()
 			kv.future = newer
 			kv.mu.Unlock()
-
-			// TODO: if current and newer both has nothing to do with me, migrate directly
 
 			// If already issued, do nothing
 			if atomic.LoadInt64(&kv.issued) == 1 {
@@ -548,9 +627,36 @@ func (kv *ShardKV) configUpdater() {
 
 // This coroutine is responsible for starting sub-goroutines when the KV is in MIGRATING state.
 func (kv *ShardKV) shardPuller() {
-	pullShard := func(shard int) {
+	pullShard := func(future int, shard int, group []string) {
+		var clients []*labrpc.ClientEnd
+		for _, srv := range group {
+			clients = append(clients, kv.make_end(srv))
+		}
 
+		args := MigrateArgs{Gid: kv.gid, MigratingTo: future, ShardId: shard}
+		reply := MigrateReply{Err: ErrRejected}
+		for reply.Err != OK {
+			for i := 0; i < len(clients); i++ {
+				ok := clients[i].Call("ShardKV.Migrate", &args, &reply)
+				if ok && reply.Err == OK {
+					break
+				}
+			}
+			time.Sleep(time.Millisecond * 1)
+		}
+
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+
+		// Issue shard update to Raft
+		op := ServerOp{MigrateTo: future, ShardId: shard, Shard: reply.Shard, Executed: reply.Executed}
+		_, _, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			DPrintln(Exp4B, Warning, "KV (%d, %d, config %d) issued shardPuller but is not leader any more!",
+				kv.gid, kv.me, kv.config.Num)
+		}
 	}
+
 	for !kv.Killed() {
 		time.Sleep(time.Millisecond * 100)
 
@@ -577,7 +683,12 @@ func (kv *ShardKV) shardPuller() {
 		}
 		for i := 0; i < NShards; i++ {
 			if config.Shards[i] != 0 && config.Shards[i] != kv.gid && future.Shards[i] == kv.gid {
-				go pullShard(i)
+				group, ok := config.Groups[config.Shards[i]]
+				if !ok {
+					DPrintln(Exp4B, Error, "KV (%d, %d, config %d) cannot find group %d in config %+v.",
+						kv.gid, kv.me, kv.config.Num, config.Shards[i], config)
+				}
+				go pullShard(future.Num, i, group)
 			}
 		}
 	}
