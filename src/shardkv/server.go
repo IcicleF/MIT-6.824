@@ -420,6 +420,8 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 			}
 
 			// Directly migrate to a clean state
+			DPrintln(Exp4B, Important, "KV (%d, %d, config %d): NORMAL -> next NORMAL.", kv.gid, kv.me, kv.config.Num)
+
 			kv.store = map[string]string{}
 			kv.config = kv.future
 			atomic.StoreInt64(&kv.state, NORMAL)
@@ -428,6 +430,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 		}
 
 		// Otherwise, snapshot current KV store, and enable service only to those prepared shards
+		DPrintln(Exp4B, Important, "KV (%d, %d, config %d): NORMAL -> MIGRATING.", kv.gid, kv.me, kv.config.Num)
 		kv.oldstore = copyStore(kv.store)
 		kv.oldstoreNum = kv.config.Num
 		for i := 0; i < NShards; i++ {
@@ -463,6 +466,8 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 
 		// If all shards are prepared, move to WAITING and new configuration
 		if kv.servable == kv.getServable(kv.future) {
+			DPrintln(Exp4B, Important, "KV (%d, %d, config %d -> %d): MIGRATING -> WAITING.",
+				kv.gid, kv.me, kv.config.Num, kv.future.Num)
 			kv.config = kv.future
 			atomic.StoreInt64(&kv.state, WAITING)
 			atomic.StoreInt64(&kv.issued, 0)
@@ -592,6 +597,7 @@ func (kv *ShardKV) configUpdater() {
 				// kv.oldstore = nil
 				// kv.oldstoreNum = 0
 				// kv.mu.Unlock()
+				DPrintln(Exp4B, Important, "KV (%d, %d, config %d): WAITING -> NORMAL.", kv.gid, kv.me, kv.config.Num)
 
 				atomic.StoreInt64(&kv.state, NORMAL)
 				atomic.StoreInt64(&kv.issued, 0)
