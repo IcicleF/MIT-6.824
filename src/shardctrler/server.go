@@ -31,7 +31,7 @@ const (
 )
 
 const ShownLogLevel = Info
-const ShownPhase = Exp4A
+const ShownPhase = 0
 const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
@@ -164,11 +164,10 @@ func (cf *Config) Balance() {
 	DPrintln(Exp4A, Log, "End balance at %+v.", *cf)
 }
 
-func (cf *Config) duplicate() Config {
+func (cf *Config) Duplicate() Config {
 	cf2 := Config{Groups: make(map[int][]string)}
-	for i := 0; i < 10; i++ {
-		cf2.Shards[i] = cf.Shards[i]
-	}
+	cf2.Num = cf.Num
+	cf2.Shards = cf.Shards
 	for k, v := range cf.Groups {
 		cf2.Groups[k] = make([]string, len(v))
 		copy(cf2.Groups[k], v)
@@ -339,9 +338,9 @@ func (sc *ShardCtrler) poller() {
 					curSeq = 0
 				}
 				if curSeq < op.SeqId {
-					// If not duplicated request
+					// If not Duplicated request
 					sc.executed[op.CliId] = op.SeqId
-					latest := sc.configs[len(sc.configs)-1].duplicate()
+					latest := sc.configs[len(sc.configs)-1].Duplicate()
 					latest.Num = len(sc.configs)
 
 					switch op.Type {
