@@ -96,7 +96,7 @@ func (ck *Clerk) Get(key string) string {
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					// Assign a new seqId because the old has been "executed" and rejected
-					args.SeqId = atomic.AddInt64(&ck.seqId, 1)
+					// args.SeqId = atomic.AddInt64(&ck.seqId, 1)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -133,7 +133,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					// Assign a new seqId because the old has been "executed" and rejected
-					args.SeqId = atomic.AddInt64(&ck.seqId, 1)
+					// args.SeqId = atomic.AddInt64(&ck.seqId, 1)
 					break
 				}
 				// ... not ok, or ErrWrongLeader

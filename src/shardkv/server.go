@@ -12,6 +12,9 @@ import (
 	"6.824/labrpc"
 	"6.824/raft"
 	"6.824/shardctrler"
+
+	"net/http"
+	"net/http/pprof"
 )
 
 func maxi64(x int64, y int64) int64 {
@@ -242,11 +245,13 @@ func (kv *ShardKV) performClientOp(op ClientOp) (int, string) {
 		return ErrWrongLeader, ""
 	}
 
-	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?) informed Raft of op[%d] = %+v.", kv.gid, kv.me, index, op)
+	DPrintln(Exp4B, Info, "KV (g-%d, %d, config ?) informed Raft of op[%d] = %+v.", kv.gid, kv.me, index, op)
 	reply := ""
-	for !kv.Killed() {
+
+	// Must not react to kv.Killed(), otherwise may report wrong information to client
+	for {
 		// Sleep first
-		time.Sleep(time.Millisecond * 1)
+		time.Sleep(time.Millisecond * 10)
 
 		// Check then
 		kv.mu.Lock()
@@ -296,9 +301,6 @@ func (kv *ShardKV) performClientOp(op ClientOp) (int, string) {
 		}()
 		return err, reply
 	}
-
-	// Must be killed
-	return ErrRejected, ""
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -335,12 +337,9 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 		return
 	}
 
-	// If configuration number does not match, reject
-	if kv.oldstoreNum+1 != args.MigratingTo {
-		DPrintln(Exp4B, Log,
-			"KV (g-%d, %d, config %d, state %d) rejected Migrate (to %d) because oldstoreNum (%d) not match.",
-			kv.gid, kv.me, kv.config.Num, atomic.LoadInt64(&kv.state), args.MigratingTo, kv.oldstoreNum)
-		reply.Err = ErrRejected
+	// If I have already progressed further, tell remote to give up (remote should find a MultiPut in its log)
+	if kv.oldstoreNum >= args.MigratingTo {
+		reply.Err = ErrTranscended
 		return
 	}
 
@@ -386,40 +385,39 @@ func (kv *ShardKV) Killed() bool {
 }
 
 func (kv *ShardKV) executeClientOp(m raft.ApplyMsg) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	// kv.mu has been locked
 
 	if m.CommandIndex != kv.receivedIndex+1 {
 		DPrintln(Exp4B, Error, "KV (g-%d, %d, config %d) received index %d out of order (prev %d)!",
 			kv.gid, kv.me, kv.config.Num, m.CommandIndex, kv.receivedIndex)
 	}
 	kv.receivedIndex = m.CommandIndex
-
 	op, _ := m.Command.(ClientOp)
+
+	// Reject operation if not executable
+	served := kv.servable[key2shard(op.Key)]
+	kv.rpcServed[m.CommandIndex] = served
+	if !served {
+		return
+	}
+
 	curSeq := kv.executed[op.CliId]
 
+	// If not duplicate
 	if curSeq < op.SeqId {
-		// If not duplicate
 		kv.executed[op.CliId] = op.SeqId
-
-		// Reject operation if not executable
-		served := kv.servable[key2shard(op.Key)]
-		kv.rpcServed[m.CommandIndex] = served
-		if !served {
-			return
-		}
-
 		if op.Type == PutOp {
 			kv.store[op.Key] = op.Value
 		} else if op.Type == AppendOp {
 			kv.store[op.Key] = kv.store[op.Key] + op.Value
 		}
+		DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) executes client op[%d] = %+v.",
+			kv.gid, kv.me, kv.config.Num, m.CommandIndex, op)
 	}
 }
 
 func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	// kv.mu has been locked
 
 	if m.CommandIndex != kv.receivedIndex+1 {
 		DPrintln(Exp4B, Error, "KV (g-%d, %d, config %d) received index %d out of order (prev %d)!",
@@ -438,8 +436,10 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 				kv.gid, kv.me, kv.config.Num, op.MigrateTo)
 			return
 		} else if kv.config.Num+1 == op.MigrateTo && state == WAITING {
-			// Or if I am still WAITING, I must wait until I am NORMAL.
+			// Or if I am recovering, or in the same configuration but still WAITING, I must wait until I am NORMAL.
 			for {
+				DPrintln(Exp4B, Warning, "KV (g-%d, %d, config %d) waiting to migrate to config %d...",
+					kv.gid, kv.me, kv.config.Num, op.MigrateTo)
 				kv.mu.Unlock()
 				time.Sleep(time.Millisecond * 100)
 				kv.mu.Lock()
@@ -449,8 +449,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 				}
 			}
 		} else if kv.config.Num+1 < op.MigrateTo {
-			// I guess this should not happen
-			DPrintln(Exp4B, Error, "KV (g-%d, %d, config %d) trying to migrate to config %d, to be resolved!",
+			DPrintln(Exp4B, Error, "KV (g-%d, %d, config %d) trying to migrate to config %d!",
 				kv.gid, kv.me, kv.config.Num, op.MigrateTo)
 		}
 
@@ -472,8 +471,8 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 			DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d -> %d): NORMAL -> WAITING.",
 				kv.gid, kv.me, kv.config.Num, kv.future.Num)
 
-			kv.store = map[string]string{}
 			kv.config = kv.future
+			kv.store = map[string]string{}
 			kv.servable = kv.getServable(kv.config) // Should be all false
 			atomic.StoreInt64(&kv.state, WAITING)
 			// atomic.StoreInt64(&kv.issued, 0)
@@ -481,7 +480,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 		}
 
 		// If I gets the shard from nowhere (i.e. initial state), migrate to NORMAL(n+1)
-		if kv.future.Num == 1 {
+		if kv.config.Num == 0 && kv.future.Num == 1 {
 			// Directly migrate to a clean state
 			DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d -> %d): initial NORMAL -> WAITING.",
 				kv.gid, kv.me, kv.config.Num, kv.future.Num)
@@ -540,7 +539,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 
 		// If all shards are prepared, move to WAITING and new configuration
 		if kv.servable == kv.getServable(kv.future) {
-			DPrintln(Exp4B, Important, "KV (%d, %d, config %d -> %d): MIGRATING -> WAITING.",
+			DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d -> %d): MIGRATING -> WAITING.",
 				kv.gid, kv.me, kv.config.Num, kv.future.Num)
 			kv.config = kv.future
 			atomic.StoreInt64(&kv.state, WAITING)
@@ -558,16 +557,18 @@ func (kv *ShardKV) poller() {
 		if m.SnapshotValid {
 			kv.mu.Lock()
 			if kv.rf.CondInstallSnapshot(m.SnapshotTerm, m.SnapshotIndex, m.Snapshot) {
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) installing snapshot till index %d.",
-					kv.gid, kv.me, kv.config.Num, m.SnapshotIndex)
 				buf := bytes.NewBuffer(m.Snapshot)
 				dec := labgob.NewDecoder(buf)
 
 				var state int64
-				dec.Decode(state)
+				var configNum int
+				var futureNum int
+				dec.Decode(&state)
 				atomic.StoreInt64(&kv.state, state)
-				dec.Decode(&kv.config)
-				dec.Decode(&kv.future)
+				dec.Decode(&configNum)
+				dec.Decode(&futureNum)
+				kv.config = kv.mck.Query(configNum)
+				kv.future = kv.mck.Query(futureNum)
 				dec.Decode(&kv.oldstore)
 				dec.Decode(&kv.oldstoreNum)
 				dec.Decode(&kv.store)
@@ -575,38 +576,41 @@ func (kv *ShardKV) poller() {
 				dec.Decode(&kv.servable)
 
 				kv.receivedIndex = m.SnapshotIndex
+				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d, state %d) installed snapshot till index %d.",
+					kv.gid, kv.me, kv.config.Num, state, m.SnapshotIndex)
 			}
 			kv.mu.Unlock()
 		} else if m.CommandValid {
+			kv.mu.Lock()
 			switch m.Command.(type) {
 			case ClientOp:
-				DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?) received confirmation of client op[%d] = %+v.",
-					kv.gid, kv.me, m.CommandIndex, m.Command)
+				// DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d) received confirmation of client op[%d] = %+v.",
+				// 	kv.gid, kv.me, kv.config.Num, m.CommandIndex, m.Command)
 				kv.executeClientOp(m)
 
 			case ServerOp:
-				DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?) received confirmation of server op[%d] = %+v.",
-					kv.gid, kv.me, m.CommandIndex, m.Command)
+				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) received confirmation of server op[%d] = %+v.",
+					kv.gid, kv.me, kv.config.Num, m.CommandIndex, m.Command)
 				kv.executeServerOp(m)
 
 			default:
-				DPrintln(Exp4B, Error, "KV (g-%d, %d, config ?) detected op %+v is neither client nor server op!",
-					kv.gid, kv.me, m.Command)
+				DPrintln(Exp4B, Error, "KV (g-%d, %d, config %d) detected op %+v is neither client nor server op!",
+					kv.gid, kv.me, kv.config.Num, m.Command)
 			}
 
 			// Check if there is need to snapshot
 			stateSize := kv.persister.RaftStateSize()
 			if kv.maxraftstate > 0 && stateSize >= kv.maxraftstate/10*8 {
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config ?) snapshots to index %d.",
-					kv.gid, kv.me, kv.receivedIndex)
+				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d, state %d) snapshots to index %d.",
+					kv.gid, kv.me, kv.config.Num, atomic.LoadInt64(&kv.state), kv.receivedIndex)
 				index := kv.receivedIndex
 
 				buf := new(bytes.Buffer)
 				enc := labgob.NewEncoder(buf)
 
 				enc.Encode(atomic.LoadInt64(&kv.state))
-				enc.Encode(kv.config)
-				enc.Encode(kv.future)
+				enc.Encode(kv.config.Num)
+				enc.Encode(kv.future.Num)
 				enc.Encode(kv.oldstore)
 				enc.Encode(kv.oldstoreNum)
 				enc.Encode(kv.store)
@@ -616,6 +620,7 @@ func (kv *ShardKV) poller() {
 				snapshot := buf.Bytes()
 				kv.rf.Snapshot(index, snapshot)
 			}
+			kv.mu.Unlock()
 		}
 	}
 }
@@ -639,7 +644,7 @@ func (kv *ShardKV) configUpdater() {
 			accepted := true
 
 			// Now, future already becomes current config
-			for _, group := range current.Groups {
+			for gid, group := range current.Groups {
 				l := len(group)
 				num := -1
 
@@ -660,8 +665,9 @@ func (kv *ShardKV) configUpdater() {
 					time.Sleep(time.Millisecond * 10)
 				}
 				if num < current.Num {
-					// DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) detected g-%d is still in configuration %d.",
-					// 	kv.gid, kv.me, current.Num, gid, num)
+					DPrintln(Exp4B, Info,
+						"KV (g-%d, %d, config %d) detected g-%d is still in configuration %d, cannot go NORMAL.",
+						kv.gid, kv.me, current.Num, gid, num)
 					accepted = false
 					break
 				}
@@ -718,14 +724,21 @@ func (kv *ShardKV) shardPuller() {
 			for i := 0; i < len(clients); i++ {
 				args := MigrateArgs{Gid: kv.gid, MigratingTo: future, ShardId: id}
 				reply := MigrateReply{}
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) pulling shard[%d] from g-%d",
-					kv.gid, kv.me, future-1, id, gid)
+				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) pulling shard[%d] from g-%d, %d",
+					kv.gid, kv.me, future-1, id, gid, i)
 				ok := clients[i].Call("ShardKV.Migrate", &args, &reply)
 
-				if ok && reply.Err == OK {
-					shard = reply.Shard
-					executed = reply.Executed
-					break outfor
+				if ok {
+					if reply.Err == OK {
+						shard = reply.Shard
+						executed = reply.Executed
+						break outfor
+					} else if reply.Err == ErrTranscended {
+						// This should occur in a recovery
+						return
+					} else if reply.Err != ErrWrongLeader {
+						break
+					}
 				}
 			}
 			time.Sleep(time.Millisecond * 100)
@@ -734,8 +747,8 @@ func (kv *ShardKV) shardPuller() {
 		DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d) pulled shard[%d] = %+v from g-%d.",
 			kv.gid, kv.me, future-1, id, shard, gid)
 
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
+		// kv.mu.Lock()
+		// defer kv.mu.Unlock()
 
 		// Issue shard update to Raft
 		op := ServerOp{MigrateTo: future, ShardId: id, Shard: shard, Executed: executed}
@@ -814,6 +827,13 @@ func (kv *ShardKV) shardPuller() {
 // for any long-running work.
 //
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
+	go func() {
+		pprofHandler := http.NewServeMux()
+		pprofHandler.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+		server := &http.Server{Addr: ":7890", Handler: pprofHandler}
+		go server.ListenAndServe()
+	}()
+
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(ClientOp{})

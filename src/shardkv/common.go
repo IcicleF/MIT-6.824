@@ -16,6 +16,7 @@ const (
 	ErrWrongLeader
 
 	ErrNotMigrating
+	ErrTranscended
 	ErrRejected
 )
 
