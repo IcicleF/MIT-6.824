@@ -32,7 +32,7 @@ const (
 
 const ShownLogLevel = Info
 const ShownPhase = Exp4A
-const CancelColoring = false
+const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
 	if typ == Error || (Debug && ((phase & ShownPhase) != 0) && typ >= ShownLogLevel) {
@@ -90,7 +90,7 @@ func DPrintln(phase int, typ int, format string, a ...interface{}) {
 
 // Take a config and balance its load
 func (cf *Config) Balance() {
-	DPrintln(Exp4A, Info, "Start balance on %+v.", *cf)
+	DPrintln(Exp4A, Log, "Start balance on %+v.", *cf)
 
 	// If no replica group
 	if len(cf.Groups) == 0 {
@@ -161,7 +161,7 @@ func (cf *Config) Balance() {
 		}
 	}
 
-	DPrintln(Exp4A, Info, "End balance at %+v.", *cf)
+	DPrintln(Exp4A, Log, "End balance at %+v.", *cf)
 }
 
 func (cf *Config) duplicate() Config {
@@ -267,7 +267,7 @@ func (sc *ShardCtrler) perform(op Op) Response {
 				num = len(sc.configs) - 1
 			}
 			reply.Result = sc.configs[num]
-			DPrintln(Exp4A, Info, "ShardCtrler %d: config[%d] = %+v.", sc.me, queryArgs.Num, reply.Result)
+			DPrintln(Exp4A, Log, "ShardCtrler %d: config[%d] = %+v.", sc.me, queryArgs.Num, reply.Result)
 			sc.mu.Unlock()
 		}
 		break
@@ -319,7 +319,7 @@ func (sc *ShardCtrler) poller() {
 			if !ok {
 				DPrintln(Exp4A, Error, "ShardCtrler %d detects a command that is not of type Op!", sc.me)
 			}
-			DPrintln(Exp4A, Info, "ShardCtrler %d received confirmation of op[%d] = Type %d %+v.",
+			DPrintln(Exp4A, Log, "ShardCtrler %d received confirmation of op[%d] = Type %d %+v.",
 				sc.me, m.CommandIndex, op.Type, op.Args)
 
 			// Record & execute
@@ -367,8 +367,12 @@ func (sc *ShardCtrler) poller() {
 					// Put new configuration into ShardCtrler
 					if op.Type != QueryOp {
 						sc.configs = append(sc.configs, latest)
-						DPrintln(Exp4A, Info, "ShardCtrler %d now has %d configuration(s) (latest %+v).",
-							sc.me, latest.Num, latest)
+						_, isLeader := sc.rf.GetState()
+						if isLeader {
+							DPrintln(Exp4A, Info,
+								"ShardCtrler now has %d configuration(s) (latest: shards: %v).",
+								latest.Num, latest.Shards)
+						}
 					}
 				}
 			}()

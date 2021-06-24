@@ -19,8 +19,6 @@ const (
 	ErrRejected
 )
 
-type Err int
-
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
@@ -30,7 +28,7 @@ type PutAppendArgs struct {
 	SeqId int64
 }
 type PutAppendReply struct {
-	Err Err
+	Err int
 }
 
 type GetArgs struct {
@@ -39,7 +37,7 @@ type GetArgs struct {
 	SeqId int64
 }
 type GetReply struct {
-	Err   Err
+	Err   int
 	Value string
 }
 
@@ -49,7 +47,7 @@ type MigrateArgs struct {
 	ShardId     int // The shard ID I am asking
 }
 type MigrateReply struct {
-	Err      Err               // OK, or ErrWrongLeader, or ErrNotMigrating
+	Err      int               // OK, or ErrWrongLeader, or ErrNotMigrating
 	Shard    map[string]string // The corresponding shard
 	Executed map[int64]int64   // Full executed map for deduplication
 }
@@ -58,6 +56,6 @@ type CheckConfigArgs struct {
 	Gid int
 }
 type CheckConfigReply struct {
-	Err Err // OK, or ErrWrongLeader
+	Err int // OK, or ErrWrongLeader
 	Num int
 }
