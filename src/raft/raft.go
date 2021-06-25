@@ -260,7 +260,10 @@ type Raft struct {
 	snapshotLock      sync.Mutex // snapshot lock
 	snapshotCond      sync.Cond  // snapshot condvar, to wait in an AppendEntries for snapshot installing
 	snapshotInstalled bool       // use with condvar to indicate a successful install
-	snapshotInited    bool       // if not set, should apply current snapshot
+
+	cachedSnapshotLock  sync.Mutex
+	cachedSnapshot      []byte
+	cachedSnapshotIndex int
 }
 
 const (
@@ -400,7 +403,6 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		rf.votedFor = -1
 		// DPrintln(Exp2C, Warning, "Raft %d setting votedFor = -1", rf.me)
 		rf.logs = LogWithSnapshot{Snapshot: nil, LastIndex: -1, LastTerm: -1, Logs: make([]LogEntry, 0)}
-		rf.snapshotInited = true
 		return
 	}
 
@@ -449,14 +451,14 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.cachedSnapshotLock.Lock()
+	defer rf.cachedSnapshotLock.Unlock()
 
 	// Need index-1 because we start log from index 0
-	rf.logs.Compact(index-1, snapshot)
-	DPrintln(Exp2D, Info, "Raft %d received compaction to index %d -> %+v.", rf.me, index, rf.logs)
-
-	rf.persist()
+	if rf.cachedSnapshotIndex < index {
+		rf.cachedSnapshot = snapshot
+		rf.cachedSnapshotIndex = index - 1
+	}
 }
 
 // Must be used when rf.mu is locked
@@ -1211,6 +1213,22 @@ func (rf *Raft) heart() {
 	}
 }
 
+// Compact logs
+func (rf *Raft) compactor() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		rf.cachedSnapshotLock.Lock()
+		if rf.logs.LastIndex < rf.cachedSnapshotIndex {
+			rf.logs.Compact(rf.cachedSnapshotIndex, rf.cachedSnapshot)
+			rf.persist()
+		}
+		rf.cachedSnapshotLock.Unlock()
+		rf.mu.Unlock()
+
+		time.Sleep(time.Millisecond * 100)
+	}
+}
+
 ///
 /// the service or tester wants to create a Raft server.
 /// @param peers      the ports of all the Raft servers (including this one) are in peers[].
@@ -1269,6 +1287,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// periodically compact log according to snapshot, to prevent rf.Snapshot() from locking rf.mu
+	rf.cachedSnapshotLock = sync.Mutex{}
+	rf.cachedSnapshotIndex = -1
+	rf.cachedSnapshot = nil
+	go rf.compactor()
 
 	return rf
 }
