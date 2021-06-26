@@ -12,9 +12,6 @@ import (
 	"6.824/labrpc"
 	"6.824/raft"
 	"6.824/shardctrler"
-
-	"net/http"
-	"net/http/pprof"
 )
 
 func maxi64(x int64, y int64) int64 {
@@ -827,12 +824,12 @@ func (kv *ShardKV) shardPuller() {
 // for any long-running work.
 //
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
-	go func() {
-		pprofHandler := http.NewServeMux()
-		pprofHandler.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
-		server := &http.Server{Addr: ":7890", Handler: pprofHandler}
-		go server.ListenAndServe()
-	}()
+	// go func() {
+	// 	pprofHandler := http.NewServeMux()
+	// 	pprofHandler.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	// 	server := &http.Server{Addr: ":7890", Handler: pprofHandler}
+	// 	go server.ListenAndServe()
+	// }()
 
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
