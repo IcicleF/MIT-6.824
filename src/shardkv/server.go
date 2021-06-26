@@ -39,7 +39,7 @@ const (
 )
 
 const ShownLogLevel = Info
-const ShownPhase = Exp4B
+const ShownPhase = 0
 const CancelColoring = true
 
 func DPrintln(phase int, typ int, format string, a ...interface{}) {
@@ -227,10 +227,11 @@ func (kv *ShardKV) performClientOp(op ClientOp) (int, string) {
 	// Check whether I am responsible for this key
 	kv.mu.Lock()
 	shard := key2shard(op.Key)
-	gid := kv.config.Shards[shard]
+	// gid := kv.config.Shards[shard]
+	servable := kv.servable[shard]
 	kv.mu.Unlock()
 
-	if gid != kv.gid {
+	if !servable {
 		// Reject if not responsible
 		return ErrWrongGroup, ""
 	}
@@ -242,7 +243,7 @@ func (kv *ShardKV) performClientOp(op ClientOp) (int, string) {
 		return ErrWrongLeader, ""
 	}
 
-	DPrintln(Exp4B, Info, "KV (g-%d, %d, config ?) informed Raft of op[%d] = %+v.", kv.gid, kv.me, index, op)
+	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?) informed Raft of op[%d] = %+v.", kv.gid, kv.me, index, op)
 	reply := ""
 
 	// Must not react to kv.Killed(), otherwise may report wrong information to client
@@ -254,6 +255,8 @@ func (kv *ShardKV) performClientOp(op ClientOp) (int, string) {
 		kv.mu.Lock()
 		receivedIndex := kv.receivedIndex
 		curSeq, ok := kv.executed[op.CliId]
+		DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d): client op[%d] = %+v blocking...",
+			kv.gid, kv.me, kv.config.Num, index, op)
 		kv.mu.Unlock()
 
 		rfTerm, stillLeader := kv.rf.GetState()
@@ -302,16 +305,17 @@ func (kv *ShardKV) performClientOp(op ClientOp) (int, string) {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?) issued Get %+v.", kv.gid, kv.me, *args)
 	op := ClientOp{Type: GetOp, Key: args.Key, CliId: args.CliId, SeqId: args.SeqId}
 	reply.Err, reply.Value = kv.performClientOp(op)
-	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?): Get %+v -> %+v.", kv.gid, kv.me, args, reply)
+	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?): Get %+v -> %+v.", kv.gid, kv.me, *args, *reply)
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	op := ClientOp{Type: str2op(args.Op), Key: args.Key, Value: args.Value, CliId: args.CliId, SeqId: args.SeqId}
 	reply.Err, _ = kv.performClientOp(op)
-	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?): PutAppend %+v -> %+v.", kv.gid, kv.me, args, reply)
+	DPrintln(Exp4B, Log, "KV (g-%d, %d, config ?): PutAppend %+v -> %+v.", kv.gid, kv.me, *args, *reply)
 }
 
 func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
@@ -327,7 +331,7 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 
 	// If I haven't progressed to (or over) MIGRATING(args.MigrateTo), reject
 	if kv.config.Num+1 < args.MigratingTo ||
-		(kv.config.Num+1 == args.MigratingTo && atomic.LoadInt64(&kv.state) == NORMAL) {
+		(kv.config.Num+1 == args.MigratingTo && atomic.LoadInt64(&kv.state) != MIGRATING) {
 		DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d), rejected Migrate (to %d) because not yet proceeded.",
 			kv.gid, kv.me, kv.config.Num, args.MigratingTo)
 		reply.Err = ErrNotMigrating
@@ -395,6 +399,8 @@ func (kv *ShardKV) executeClientOp(m raft.ApplyMsg) {
 	served := kv.servable[key2shard(op.Key)]
 	kv.rpcServed[m.CommandIndex] = served
 	if !served {
+		DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d): unable to serve client op[%d] = %+v.",
+			kv.gid, kv.me, kv.config.Num, m.CommandIndex, op)
 		return
 	}
 
@@ -408,7 +414,12 @@ func (kv *ShardKV) executeClientOp(m raft.ApplyMsg) {
 		} else if op.Type == AppendOp {
 			kv.store[op.Key] = kv.store[op.Key] + op.Value
 		}
-		DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) executes client op[%d] = %+v.",
+		DPrintln(Exp4B, Log,
+			"KV (g-%d, %d, config %d) executes client op[%d] = %+v (shard %d belongs to g-%d).",
+			kv.gid, kv.me, kv.config.Num, m.CommandIndex, op,
+			key2shard(op.Key), kv.config.Shards[key2shard(op.Key)])
+	} else {
+		DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d): duplicate client op[%d] = %+v.",
 			kv.gid, kv.me, kv.config.Num, m.CommandIndex, op)
 	}
 }
@@ -457,7 +468,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 		if !kv.isActive(kv.future) {
 			// If I am active in the old configuration, I should save the current KV store for others
 			if kv.isActive(kv.config) {
-				DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d -> %d): to be inactive, oldstore = %+v.",
+				DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d -> %d): to be inactive, oldstore = %+v.",
 					kv.gid, kv.me, kv.config.Num, kv.future.Num, kv.store)
 				kv.oldstore = copyStore(kv.store)
 				kv.oldstoreNum = kv.config.Num
@@ -489,7 +500,7 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 		}
 
 		// Otherwise, snapshot current KV store, and enable service only to those prepared shards
-		DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d): leaving NORMAL, oldstore = %+v.",
+		DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d): leaving NORMAL, oldstore = %+v.",
 			kv.gid, kv.me, kv.config.Num, kv.store)
 		kv.oldstore = copyStore(kv.store)
 		kv.oldstoreNum = kv.config.Num
@@ -514,6 +525,9 @@ func (kv *ShardKV) executeServerOp(m raft.ApplyMsg) {
 			DPrintln(Exp4B, Warning, "KV (g-%d, %d, config %d) does a MultiPut, but not in MIGRATING, skipped!",
 				kv.gid, kv.me, kv.config.Num)
 			return
+		} else if kv.config.Num+1 < op.MigrateTo {
+			DPrintln(Exp4B, Error, "KV (g-%d, %d, config %d) does a MultiPut (to %d)!",
+				kv.gid, kv.me, kv.config.Num, op.MigrateTo)
 		}
 		if kv.servable[op.ShardId] {
 			DPrintln(Exp4B, Warning, "KV (g-%d, %d, config %d) skips duplicate MultiPut to shard %d.",
@@ -573,7 +587,7 @@ func (kv *ShardKV) poller() {
 				dec.Decode(&kv.servable)
 
 				kv.receivedIndex = m.SnapshotIndex
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d, state %d) installed snapshot till index %d.",
+				DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d, state %d) installed snapshot till index %d.",
 					kv.gid, kv.me, kv.config.Num, state, m.SnapshotIndex)
 			}
 			kv.mu.Unlock()
@@ -581,12 +595,12 @@ func (kv *ShardKV) poller() {
 			kv.mu.Lock()
 			switch m.Command.(type) {
 			case ClientOp:
-				// DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d) received confirmation of client op[%d] = %+v.",
-				// 	kv.gid, kv.me, kv.config.Num, m.CommandIndex, m.Command)
+				DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d) received confirmation of client op[%d] = %+v.",
+					kv.gid, kv.me, kv.config.Num, m.CommandIndex, m.Command)
 				kv.executeClientOp(m)
 
 			case ServerOp:
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) received confirmation of server op[%d] = %+v.",
+				DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d) received confirmation of server op[%d] = %+v.",
 					kv.gid, kv.me, kv.config.Num, m.CommandIndex, m.Command)
 				kv.executeServerOp(m)
 
@@ -598,8 +612,8 @@ func (kv *ShardKV) poller() {
 			// Check if there is need to snapshot
 			stateSize := kv.persister.RaftStateSize()
 			if kv.maxraftstate > 0 && stateSize >= kv.maxraftstate/10*8 {
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d, state %d) snapshots to index %d.",
-					kv.gid, kv.me, kv.config.Num, atomic.LoadInt64(&kv.state), kv.receivedIndex)
+				DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d, state %d) snapshots to index %d = %+v.",
+					kv.gid, kv.me, kv.config.Num, atomic.LoadInt64(&kv.state), kv.receivedIndex, kv.store)
 				index := kv.receivedIndex
 
 				buf := new(bytes.Buffer)
@@ -616,6 +630,8 @@ func (kv *ShardKV) poller() {
 
 				snapshot := buf.Bytes()
 				kv.rf.Snapshot(index, snapshot)
+				DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d, state %d) successfully snapshots to index %d.",
+					kv.gid, kv.me, kv.config.Num, atomic.LoadInt64(&kv.state), kv.receivedIndex)
 			}
 			kv.mu.Unlock()
 		}
@@ -648,12 +664,13 @@ func (kv *ShardKV) configUpdater() {
 				// For each group, poll until a leader successfully responds me
 				for num == -1 {
 					for i := 0; i < l; i++ {
-						serverName := group[i]
-						srv := kv.make_end(serverName)
+						srv := kv.make_end(group[i])
 
 						args := CheckConfigArgs{Gid: kv.gid}
 						reply := CheckConfigReply{}
 						ok := srv.Call("ShardKV.CheckConfig", &args, &reply)
+						// DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) check config at %s and get %v.",
+						// 	kv.gid, kv.me, current.Num, group[i], reply)
 						if ok && reply.Err == OK {
 							num = reply.Num
 							break
@@ -662,7 +679,7 @@ func (kv *ShardKV) configUpdater() {
 					time.Sleep(time.Millisecond * 10)
 				}
 				if num < current.Num {
-					DPrintln(Exp4B, Info,
+					DPrintln(Exp4B, Log,
 						"KV (g-%d, %d, config %d) detected g-%d is still in configuration %d, cannot go NORMAL.",
 						kv.gid, kv.me, current.Num, gid, num)
 					accepted = false
@@ -721,8 +738,8 @@ func (kv *ShardKV) shardPuller() {
 			for i := 0; i < len(clients); i++ {
 				args := MigrateArgs{Gid: kv.gid, MigratingTo: future, ShardId: id}
 				reply := MigrateReply{}
-				DPrintln(Exp4B, Info, "KV (g-%d, %d, config %d) pulling shard[%d] from g-%d, %d",
-					kv.gid, kv.me, future-1, id, gid, i)
+				// DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d) pulling shard[%d] from g-%d, %d",
+				// 	kv.gid, kv.me, future-1, id, gid, i)
 				ok := clients[i].Call("ShardKV.Migrate", &args, &reply)
 
 				if ok {
@@ -741,7 +758,7 @@ func (kv *ShardKV) shardPuller() {
 			time.Sleep(time.Millisecond * 100)
 		}
 
-		DPrintln(Exp4B, Important, "KV (g-%d, %d, config %d) pulled shard[%d] = %+v from g-%d.",
+		DPrintln(Exp4B, Log, "KV (g-%d, %d, config %d) pulled shard[%d] = %+v from g-%d.",
 			kv.gid, kv.me, future-1, id, shard, gid)
 
 		// kv.mu.Lock()
@@ -792,6 +809,27 @@ func (kv *ShardKV) shardPuller() {
 				go pullShard(future.Num, i, config.Shards[i], group)
 			}
 		}
+	}
+}
+
+// Verbose goroutine, will output as long as the server is alive
+func (kv *ShardKV) livenessChecker() {
+	for !kv.Killed() {
+		time.Sleep(time.Second * 2)
+		// DPrintln(Exp4B, Important, "[VERBOSE] KV (g-%d, %d): living.", kv.gid, kv.me)
+	}
+	DPrintln(Exp4B, Important, "[VERBOSE] KV (g-%d, %d) has been killed.", kv.gid, kv.me)
+}
+
+// Verbose goroutine, will output as long as there are no deadlocks
+func (kv *ShardKV) verbose() {
+	for !kv.Killed() {
+		time.Sleep(time.Second * 2)
+
+		kv.mu.Lock()
+		DPrintln(Exp4B, Important, "[VERBOSE] KV (g-%d, %d): config %d, state %d, servable %v, received log %d.",
+			kv.gid, kv.me, kv.config.Num, atomic.LoadInt64(&kv.state), kv.servable, kv.receivedIndex)
+		kv.mu.Unlock()
 	}
 }
 
@@ -865,6 +903,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.poller()
 	go kv.configUpdater()
 	go kv.shardPuller()
+
+	go kv.livenessChecker()
+	go kv.verbose()
 
 	return kv
 }
