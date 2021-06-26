@@ -357,13 +357,12 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 
 func (kv *ShardKV) CheckConfig(args *CheckConfigArgs, reply *CheckConfigReply) {
 	// NOTICE: Pay attention to dead locks.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	_, isLeader := kv.rf.GetState()
 	if isLeader {
+		kv.mu.Lock()
 		reply.Err = OK
 		reply.Num = kv.config.Num
+		kv.mu.Unlock()
 	} else {
 		reply.Err = ErrWrongLeader
 	}
