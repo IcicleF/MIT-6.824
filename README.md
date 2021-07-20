@@ -14,7 +14,7 @@ Nothing to say.
 
 ## Lab 3
 
-Too easy, emit.
+Too easy, omit.
 
 ## Lab 4
 
